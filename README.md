@@ -1,7 +1,7 @@
 # TDS Project 1: Data Analyst Telegram Bot
 
 An LLM agent reachable on Telegram. It receives a data analysis question as
-plain text, researches or computes the answer using a tool loop, and replies
+plain text, computes or researches the answer using a tool loop, and replies
 with exactly one JSON object in the shape the message asked for.
 
 Every run is logged as JSONL and served publicly at `/run.jsonl`.
@@ -16,22 +16,59 @@ One process runs two things:
    chosen over webhooks so the bot needs no inbound routing and behaves
    identically on a laptop and on a host.
 
-Each incoming message is handled in its own thread, so a slow research question
-never blocks the next message.
+Each incoming message is handled in its own thread, serialised per chat by a
+lock so a slow answer can never arrive after the following question.
 
 ### The agent loop
 
-The model is given four tools and iterates until it produces a final answer,
-capped at 20 steps or 200 seconds of wall clock:
+The model is given five tools and iterates until it produces a final answer,
+capped at 12 steps or 100 seconds of wall clock:
 
 | Tool | Purpose |
 | --- | --- |
+| `run_python` | Arithmetic and statistics over data already in hand. |
 | `web_search` | Find sources. Tries Tavily, Brave, Google CSE, then a DuckDuckGo scraper, using whichever is configured. |
 | `fetch_url` | Download HTML or PDF and return readable text. PDFs are parsed with `pdfplumber`, including table extraction. |
 | `search_document` | Ranked search inside an already fetched document. |
 | `read_tables` | Return every table extracted from a fetched PDF. |
 
 ## Design decisions
+
+**Routing before researching.** The first question the agent settles is where
+the data lives. A message that hands over a list of numbers is self contained,
+so it is answered with one `run_python` call and no network access at all. Only
+a message that names an external source (a dataset, a URL, MOSPI, the SRS
+bulletins) enters the research path. `needs_external_data` decides this by
+counting numeric literals in the message body, after stripping the output
+template so the template's own placeholders are not counted.
+
+**Task boundary detection.** A grader sends its next question seconds after
+receiving the previous reply, so elapsed time cannot distinguish a new question
+from the next turn of the current one. The reliable separator is the output
+template: a message that states its own JSON shape is the terminus of a task,
+so the message after it begins a new one and the history is cleared. A message
+that carries no data, names no source, and opens with a continuation cue
+(`Now`, `Ignore`, `Also`) is treated as a later turn of the current task and
+keeps the history. Two safety nets remain: a 240 second silence also clears the
+history, and the final message is labelled explicitly in the prompt as the one
+to answer.
+
+**Shape mirroring.** The grader parses the whole reply and compares it to the
+expected answer with `==`, so a correct value inside the wrong wrapper scores
+zero. Some messages ask for a bare object (`{"state": ...}`), others for the
+`{"answer": ..., "log_url": ...}` envelope. `conform` parses the skeleton out
+of the message and reshapes the model's output to match it: it adds the
+envelope when the message showed one, strips it when the message did not, and
+restores the asked-for key name when the model invented its own. `log_url` is
+always written by the program, never by the model, because models fabricate
+URLs.
+
+**One reply per message.** The grading harness calls `get_response()` once per
+message sent, so it reads the *first* message the bot sends back. A progress
+update or acknowledgement would be consumed as the answer. The bot therefore
+sends exactly one message per incoming message and never a status line. In a
+multi turn exchange it must still answer every turn, because the harness waits
+for a reply before sending the next message; only the final reply is graded.
 
 **Ranked retrieval with inverse frequency weighting.** A naive search inside a
 document returns the first matches in document order. Because a question's own
@@ -51,10 +88,13 @@ the result carries a note that the figures are probably chart images and the
 document should be dropped. Several MOSPI publications store state level data
 as charts, which no text extractor can recover.
 
-**Grounding gate.** The agent may not produce a final answer before at least
-one `web_search` or `fetch_url` has succeeded. `run_python` deliberately does
-not count, because a model with no data will otherwise write a table of
-invented numbers and compute over it.
+**Grounding gate, applied conditionally.** On the research path the agent may
+not produce a final answer before at least one `web_search` or `fetch_url` has
+succeeded, because a model with no data will otherwise write a table of
+invented numbers and compute over it. The gate is skipped entirely when the
+data is inline: forcing a search on a question that already contains its
+numbers sends the agent to the web for an answer it was handed, and it returns
+with an answer to a different question.
 
 **Placeholder detection and commit pass.** Under exact match grading, an
 unanswered question and a wrong answer score identically, so committing to a
@@ -64,7 +104,10 @@ known filler strings; when it fires, the model gets one more call demanding a
 commitment.
 
 **Shape aware fallback.** If everything fails, the JSON skeleton is parsed out
-of the question itself so the reply at least matches the requested shape.
+of the question itself so the reply at least matches the requested shape. The
+skeleton parser strips the quotes around a quoted placeholder before
+substituting, since `"<state name>"` would otherwise substitute to `""?""`,
+which is not valid JSON.
 
 **Capped `max_tokens`.** OpenRouter reserves the requested ceiling against the
 account balance before a call runs, so an uncapped request fails on a low
@@ -74,6 +117,12 @@ balance even though the actual reply is tiny. Capped at 1200.
 `print()`, since models habitually end a snippet as if in a REPL and would
 otherwise waste a step discovering that a subprocess prints nothing.
 
+**Step and time budget sized to the harness.** The harness applies one timeout
+to an entire multi turn exchange, so a three turn question gets the same total
+budget as a single turn one. The per message budget is therefore 100 seconds
+and 12 steps: if twelve tool calls have not found the answer, twenty will not
+either, and the remaining time is better spent on the next turn.
+
 ## Running locally
 
 ```bash
@@ -81,6 +130,9 @@ pip install -r requirements.txt
 cp .env.example .env        # fill in, then export the variables
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+`python3 test_logic.py` exercises the routing, task boundary and shape
+conformance logic with no network and no API keys.
 
 ## Deployment
 
@@ -92,7 +144,8 @@ Render web service.
   `PUBLIC_BASE_URL`, optionally `MODEL` and `MAX_TOKENS`
 
 An UptimeRobot monitor pings `/` every five minutes so the free instance never
-idles into a cold start.
+idles into a cold start, which would otherwise consume most of a question's
+timeout budget.
 
 ## Known limitations and compromises
 
@@ -103,8 +156,10 @@ verification disabled. This is a deliberate tradeoff for reading public
 statistical bulletins and would not be acceptable in production.
 
 **Ephemeral log storage.** Render's disk resets on restart, so `run.jsonl`
-holds the current session rather than full history. It is always publicly
-downloadable, which is what the specification requires.
+holds the current session rather than full history. Setting `GITHUB_TOKEN` and
+`GITHUB_REPO` switches `log_url` to a static `raw.githubusercontent.com` URL
+that survives restarts. Either way it is publicly downloadable, which is what
+the specification requires.
 
 **Chart data is unrecoverable.** Where a publication renders state level
 figures as an image, no text extraction can recover them. The agent detects
@@ -116,9 +171,15 @@ columns: Maternal Mortality *Ratio* (deaths per 100,000 live births) and
 Maternal Mortality *Rate* (per 1,000 women of reproductive age). For 2021 to
 2023 the highest Ratio is Odisha at 153, while the highest Rate is shared by
 Madhya Pradesh and Uttar Pradesh at 12. Questions saying "rate" colloquially
-mean the Ratio, which is the widely reported headline figure, and that is the
-reading the agent takes.
+mean the Ratio, which is the widely reported headline figure. The agent is told
+the expected magnitude of each column, so a maximum below 40 is recognised as
+the wrong column rather than reported as the answer.
 
 **JavaScript rendered pages.** Some MOSPI pages build their tables in the
 browser, so a plain fetch returns an empty shell. The agent treats a near empty
 page as unusable and looks for a PDF or an alternative source.
+
+**Key renaming is top level only.** `conform` restores an asked-for key name
+only for a single key object. A nested object whose inner keys the model
+renamed is left alone, since guessing which invented key maps to which
+requested one is less safe than leaving the model's output intact.

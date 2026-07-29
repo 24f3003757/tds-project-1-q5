@@ -415,8 +415,12 @@ EVIDENCE RULES (most important):
 1. Never invent data. Writing a table of made up numbers into run_python and
    computing over it is the worst possible failure. Placeholders such as
    "State A", "State D", "<state name>", "Example" or "N/A" are always wrong.
-2. If you do not already know an exact source URL, call web_search FIRST to
-   find one, then fetch_url to read it. Only then compute.
+2. FIRST decide where the data is. If the question ALREADY CONTAINS the
+   numbers, the data is in the message: use run_python on those exact numbers
+   and answer immediately. Do NOT search the web. Searching when the data was
+   handed to you is a serious error and wastes the whole time budget.
+   Only when the question names an external source or dataset do you call
+   web_search to find a URL, then fetch_url to read it, then compute.
 3. run_python is for arithmetic over data you actually retrieved, or for
    data the user pasted into the message. It is never a source of facts.
    Drop rows with missing values before comparing them, or max() will fail
@@ -438,31 +442,55 @@ EVIDENCE RULES (most important):
    their numbers, and you must have compared them. If you have only seen a
    national figure or a definition, you have not found the answer yet. Never
    fall back on what you remember.
-8. Indian statistics questions mean INDIAN states. Always put "India" in your
+8. Maternal mortality is reported as two different columns. The RATIO is
+   deaths per 100,000 live births and its values run from about 20 to 250.
+   The RATE is per 1,000 women of reproductive age and its values run from
+   about 1 to 15. A question saying "maternal mortality rate" colloquially
+   means the RATIO, the widely reported headline figure. If the column you
+   read has a maximum below 40 you are in the wrong column: find the other.
+9. Indian statistics questions mean INDIAN states. Always put "India" in your
    search queries or you will get United States data. Try mospi.gov.in, data.gov.in, the Sample
    Registration System bulletins, PIB releases, and their PDF reports.
 
 OUTPUT RULES:
-9. Your FINAL message must be exactly one JSON object and nothing else.
-   No prose, no markdown fences, no explanation.
-10. Match the JSON shape the user asked for, key for key, exactly. If the user
-   asks for {{"state": "<name>"}} you send {{"state": "..."}} and nothing more.
-   If the requested shape contains "log_url", use this value: {LOG_URL}
-11. NEVER answer with N/A, null, unknown, empty strings or angle brackets.
+10. Your FINAL message must be exactly one JSON object and nothing else.
+    No prose, no markdown fences, no explanation, no greeting.
+11. COPY the JSON shape from the message, key for key. Use the exact key names
+    it shows. If it asks for {{"sorted": [...]}} the key is "sorted", not
+    "sorted_values" and not a name you invent. Never add keys it did not ask
+    for. If, and only if, the shape it shows contains "log_url", include
+    "log_url" with this value: {LOG_URL}
+12. NEVER answer with N/A, null, unknown, empty strings or angle brackets.
     If you are unsure, commit to your single most likely answer. An unanswered
     question scores the same as a wrong one, so guessing strictly dominates.
-12. Numbers must be JSON numbers, not strings, unless strings were asked for.
-13. If several messages were sent, answer only the LAST one.
+13. Numbers must be JSON numbers, not strings, unless strings were asked for.
+    Round exactly as the message asks. If it does not say, and the value is
+    not a whole number, give one decimal place.
+14. If several messages were sent, answer ONLY the final one. Earlier messages
+    are background for it, never the question itself.
 """
 
 # ------------------------------------------------------------------- agent
 
 
-def solve(history, run_id, max_steps=20, time_budget=200):
+def solve(history, run_id, max_steps=12, time_budget=100):
     """Returns (final_text, convo) so the caller can push for a commitment."""
     """history is a list of the user's messages in this conversation."""
     convo = [{"role": "system", "content": SYSTEM}]
-    convo += [{"role": "user", "content": m} for m in history]
+    convo += [{"role": "user", "content": m} for m in history[:-1]]
+    if history:
+        # Naming the final message explicitly. A model given four bare user
+        # turns will happily answer the most interesting one rather than the
+        # last one.
+        convo.append({"role": "user", "content":
+            "THIS IS THE QUESTION TO ANSWER NOW. Anything above is background "
+            "context only, not the question.\n\n" + history[-1]})
+
+    # The grounding gate below exists to stop the model inventing a table and
+    # computing over it. It must NOT fire when the message already carries its
+    # own data, or an inline arithmetic question is forced onto the web and
+    # comes back with an answer to a different question entirely.
+    need_source = needs_external_data(" ".join(history))
     grounded = False  # True once a real source has been retrieved
     deadline = time.time() + time_budget
     seen_calls = {}   # (tool, args) -> how many times already made
@@ -480,7 +508,7 @@ def solve(history, run_id, max_steps=20, time_budget=200):
             content=msg.content, tool_calls=[c.function.name for c in (msg.tool_calls or [])])
 
         if not msg.tool_calls:
-            if not grounded:
+            if need_source and not grounded:
                 convo.append({"role": "user", "content":
                     "You have not retrieved any real source yet. Call web_search "
                     "to find an authoritative page, then fetch_url to read it. "
@@ -545,6 +573,116 @@ PLACEHOLDERS = {"", "n/a", "na", "none", "null", "unknown", "not available",
                 "state c", "state d", "xxx", "answer", "value"}
 
 
+TEMPLATE_RE = re.compile(
+    r"reply with only|respond with only|reply with exactly|reply with ONLY",
+    re.I)
+
+# Words that mean "the thing I sent you before", which is the one case where a
+# new message genuinely needs the previous turns.
+PRIOR_RE = re.compile(
+    r"\b(above|these|those|that data|that list|previous|earlier|"
+    r"same (?:data|numbers|list|values))\b", re.I)
+
+# A follow up turn often names nothing at all: "Ignore the smallest value."
+# An imperative opener, with no data and no source of its own, is a
+# continuation of whatever came before it.
+CONT_RE = re.compile(
+    r"^\s*(now|also|then|and|next|instead|ignore|exclude|drop|remove|"
+    r"using|from (?:that|those|it)|what about)\b", re.I)
+
+# Naming any of these means the data lives outside the message.
+DATASET_HINTS = ("mospi", "data.gov.in", "census", "http://", "https://",
+                 "dataset", "bulletin", "nfhs", "pib", "world bank", "rbi",
+                 "niti", "sample registration", "srs ", "public data")
+
+
+def _payload(text):
+    """The question with its output template stripped off.
+
+    The template ("Reply with ONLY {"mean": <number>}") is boilerplate present
+    in every message, so counting digits without removing it first would count
+    the template's own placeholders.
+    """
+    return TEMPLATE_RE.split(text)[0]
+
+
+def has_inline_data(text):
+    """True when the message hands over enough numbers to be self contained.
+
+    Four is the threshold: a lookup question ("highest maternal mortality rate
+    based on MOSPI data") carries at most a year or two, while a compute
+    question carries a whole list.
+    """
+    return len(re.findall(r"-?\d+(?:\.\d+)?", _payload(text))) >= 4
+
+
+def needs_external_data(text):
+    """Whether this question requires the web. Naming a source always wins:
+    a question can quote a few figures and still point at a dataset."""
+    low = text.lower()
+    if any(h in low for h in DATASET_HINTS):
+        return True
+    return not has_inline_data(text)
+
+
+def is_task_terminus(text):
+    """True when a message states its own output shape.
+
+    Such a message completes a task, so whatever follows it is a NEW task.
+    This is the only reliable separator available: the grader sends its next
+    question seconds after receiving the previous reply, so no elapsed-time
+    threshold can tell a new question from the next turn of the current one.
+    """
+    return bool(TEMPLATE_RE.search(text)) or requested_shape(text) is not None
+
+
+def references_prior(text):
+    """True when a message points back at data sent in an earlier turn.
+
+    Carrying its own data or naming its own source both settle it: the message
+    is self sufficient and cannot be a continuation.
+    """
+    if has_inline_data(text) or needs_external_data(text) is True and any(
+            h in text.lower() for h in DATASET_HINTS):
+        return False
+    return bool(PRIOR_RE.search(text)) or bool(CONT_RE.search(text))
+
+
+def conform(obj, template):
+    """Force the reply into the exact shape the message asked for.
+
+    The grader parses the whole reply and compares it to the expected answer
+    with ==, so a correct value inside the wrong wrapper scores zero. Some
+    messages ask for a bare object, others for the {"answer": ..., "log_url":
+    ...} envelope. Mirror whichever the message showed rather than guessing.
+    """
+    if not isinstance(template, dict) or not isinstance(obj, dict):
+        return obj
+
+    want_env = "log_url" in template and "answer" in template
+    has_env = "log_url" in obj and "answer" in obj
+
+    if want_env:
+        inner = obj["answer"] if has_env else obj
+        # log_url is written by us, never by the model, which fabricates URLs.
+        return {"answer": inner, "log_url": LOG_URL}
+
+    if has_env:                      # envelope sent but not requested: unwrap
+        inner = obj["answer"]
+        obj = inner if isinstance(inner, dict) else obj
+        if not isinstance(obj, dict):
+            return obj
+
+    # Single key template and a single key reply: the model renamed the key.
+    # The value is what was computed, so keep it and restore the asked-for name.
+    if len(template) == 1 and len(obj) == 1:
+        want, got = next(iter(template)), next(iter(obj))
+        if want != got:
+            return {want: obj[got]}
+
+    return obj
+
+
 def requested_shape(text):
     """Pull the JSON skeleton the question asked for, so that even a failed run
     replies in the right shape rather than a shape that is certainly wrong."""
@@ -554,7 +692,13 @@ def requested_shape(text):
             return json.loads(blob)
         except json.JSONDecodeError:
             # skeletons contain <placeholders>, so quote them before parsing
-            patched = re.sub(r"<[^>{}]*>", '"?"', blob)
+            # A quoted placeholder ("<state name>") must lose its own quotes
+            # too, or substituting gives ""?"" which is not valid JSON. This
+            # ran first for years and silently returned None for every
+            # question whose skeleton quoted its placeholders, which is most
+            # of them.
+            patched = re.sub(r'"<[^>{}]*>"', '"?"', blob)
+            patched = re.sub(r"<[^>{}]*>", '"?"', patched)
             try:
                 return json.loads(patched)
             except json.JSONDecodeError:
@@ -644,6 +788,16 @@ def _handle(chat_id, text):
         log("context_reset", run_id=run_id, chat_id=chat_id, gap=round(gap, 1))
 
     hist = HISTORY.setdefault(chat_id, [])
+
+    # A message that carried its own output template ended a task, so this new
+    # message starts a fresh one unless it explicitly points back. Without this
+    # the fifth graded question still has questions one to four sitting in the
+    # prompt, and an inline mean question comes back as a state name.
+    if hist and is_task_terminus(hist[-1]) and not references_prior(text):
+        log("task_boundary", run_id=run_id, chat_id=chat_id,
+            closed=hist[-1][:120])
+        hist.clear()
+
     hist.append(text)
     del hist[:-6]
     log("received", run_id=run_id, chat_id=chat_id, text=text)
@@ -678,9 +832,17 @@ def _handle(chat_id, text):
         except Exception as e:
             log("commit_error", run_id=run_id, error=repr(e))
 
+    template = requested_shape(text)
     if obj is None:
-        obj = requested_shape(text) or {"answer": None, "log_url": LOG_URL}
+        obj = template or {"answer": None, "log_url": LOG_URL}
         log("shape_fallback", run_id=run_id, obj=obj)
+
+    before = json.dumps(obj, ensure_ascii=False, default=str)
+    obj = conform(obj, template)
+    after = json.dumps(obj, ensure_ascii=False, default=str)
+    if before != after:
+        log("conformed", run_id=run_id, before=before[:400], after=after[:400])
+
     reply = json.dumps(obj, ensure_ascii=False)
     log("replied", run_id=run_id, reply=reply)
     send(chat_id, reply)

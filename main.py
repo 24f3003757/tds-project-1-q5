@@ -614,18 +614,38 @@ def extract_json_object(text):
 
 # ---------------------------------------------------------------- telegram
 
-HISTORY = {}
+HISTORY = {}        # chat_id -> list of recent message texts
+LAST_SEEN = {}      # chat_id -> timestamp of the previous message
+CHAT_LOCKS = {}     # chat_id -> lock, so replies cannot overtake each other
+LOCKS_GUARD = threading.Lock()
+CONTEXT_GAP = 240   # seconds; a longer pause means a new, unrelated question
+
+
+def chat_lock(chat_id):
+    with LOCKS_GUARD:
+        return CHAT_LOCKS.setdefault(chat_id, threading.Lock())
 
 
 def send(chat_id, text):
     requests.post(f"{API}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=30)
 
 
-def handle(chat_id, text):
+def _handle(chat_id, text):
     run_id = str(uuid.uuid4())
+    now = time.time()
+
+    # A long silence means this is a fresh question, not a later turn of the
+    # previous one. Carrying stale context across questions made the agent
+    # answer with data from an earlier exchange.
+    gap = now - LAST_SEEN.get(chat_id, 0)
+    LAST_SEEN[chat_id] = now
+    if gap > CONTEXT_GAP:
+        HISTORY[chat_id] = []
+        log("context_reset", run_id=run_id, chat_id=chat_id, gap=round(gap, 1))
+
     hist = HISTORY.setdefault(chat_id, [])
     hist.append(text)
-    del hist[:-10]
+    del hist[:-6]
     log("received", run_id=run_id, chat_id=chat_id, text=text)
 
     convo = None
@@ -664,11 +684,19 @@ def handle(chat_id, text):
     reply = json.dumps(obj, ensure_ascii=False)
     log("replied", run_id=run_id, reply=reply)
     send(chat_id, reply)
+
+
+def handle(chat_id, text):
+    """One at a time per chat, so a slow answer cannot arrive after the next
+    question and shift every subsequent reply by one."""
+    with chat_lock(chat_id):
+        _handle(chat_id, text)
     publish_log()   # after replying, so it never delays the answer
 
 
 def poll_loop():
     offset = None
+    started = time.time()
     log("boot", log_url=LOG_URL, model=MODEL)
     while True:
         try:
@@ -678,6 +706,13 @@ def poll_loop():
                 offset = upd["update_id"] + 1
                 msg = upd.get("message") or {}
                 text = msg.get("text")
+                # Messages queued while the instance was down are stale: the
+                # sender has stopped waiting, and answering now would be
+                # consumed as the reply to their NEXT question.
+                if msg.get("date", 0) < started - 90:
+                    log("stale_skipped", chat_id=(msg.get("chat") or {}).get("id"),
+                        text=(text or "")[:120])
+                    continue
                 if text and text.strip() != "/start":
                     threading.Thread(
                         target=handle, args=(msg["chat"]["id"], text), daemon=True).start()

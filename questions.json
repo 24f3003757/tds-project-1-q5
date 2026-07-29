@@ -1,0 +1,48 @@
+[
+  {
+    "id": "inline_mean",
+    "timeout_seconds": 300,
+    "randomize": { "nums": "rng.sample(range(10, 500), 5)" },
+    "messages": [
+      "Here are five readings: $nums. Return their arithmetic mean rounded to 2 decimal places. Reply with ONLY this JSON object and nothing else: {\"mean\": <number>}"
+    ],
+    "expected_code": "{\"mean\": round(sum(nums)/len(nums), 2)}"
+  },
+  {
+    "id": "inline_list",
+    "timeout_seconds": 300,
+    "randomize": { "vals": "rng.sample(range(1, 200), 6)" },
+    "messages": [
+      "Given $vals, return the values sorted descending. Reply with ONLY this JSON object and nothing else: {\"sorted\": [<numbers>]}"
+    ],
+    "expected_code": "{\"sorted\": sorted(vals, reverse=True)}"
+  },
+  {
+    "id": "multi_turn_stats",
+    "timeout_seconds": 300,
+    "randomize": { "nums": "rng.sample(range(20, 900), 7)" },
+    "messages": [
+      "I am going to give you some data, then ask one question about it. Acknowledge briefly.",
+      "The data is $nums.",
+      "What is the maximum value? Reply with ONLY this JSON object and nothing else: {\"max\": <number>}"
+    ],
+    "expected_code": "{\"max\": max(nums)}"
+  },
+  {
+    "id": "wrapper_shape",
+    "timeout_seconds": 300,
+    "randomize": { "nums": "rng.sample(range(1, 100), 4)" },
+    "messages": [
+      "Sum these numbers: $nums. Reply with ONLY this JSON object and nothing else: {\"answer\": {\"sum\": <number>}, \"log_url\": \"<public wget-able URL to your agent's JSONL log>\"}"
+    ],
+    "expected": "MANUAL_CHECK: verify the reply has keys answer.sum equal to the sum, and a real log_url"
+  },
+  {
+    "id": "mmr_lookup",
+    "timeout_seconds": 300,
+    "messages": [
+      "Which state has the highest maternal mortality rate based on MOSPI data? Reply with ONLY a JSON object like {\"state\": \"<state name>\"}"
+    ],
+    "expected": { "state": "Odisha" }
+  }
+]

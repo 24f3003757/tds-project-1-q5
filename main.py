@@ -448,7 +448,16 @@ EVIDENCE RULES (most important):
    about 1 to 15. A question saying "maternal mortality rate" colloquially
    means the RATIO, the widely reported headline figure. If the column you
    read has a maximum below 40 you are in the wrong column: find the other.
-9. Indian statistics questions mean INDIAN states. Always put "India" in your
+9. Statistical bulletins are REISSUED every year and the ranking changes
+   between editions. Establish which edition you are reading before you
+   trust it, and always prefer the newest. The SRS Special Bulletin on
+   Maternal Mortality has editions 2017-19, 2018-20, 2019-21, 2020-22,
+   2021-23 and 2022-24. Assam led the older editions and no longer does.
+   If the source you found is more than one edition behind the newest one
+   you can find, search again with the newer period in the query before
+   answering. Never answer a "which is highest" question from a news
+   summary of an old bulletin.
+10. Indian statistics questions mean INDIAN states. Always put "India" in your
    search queries or you will get United States data. Try mospi.gov.in, data.gov.in, the Sample
    Registration System bulletins, PIB releases, and their PDF reports.
 

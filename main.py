@@ -161,7 +161,17 @@ _gh_lock = threading.Lock()
 
 def publish_log():
     """Commit the current run.jsonl to GitHub. Safe to call often; failures
-    are swallowed so a publishing problem can never break a reply."""
+    are swallowed so a publishing problem can never break a reply.
+
+    The commit message carries [skip render], and that is load bearing rather
+    than tidiness. The host redeploys on every push to the tracked branch, so
+    without it each reply commits a log, the commit triggers a deploy, and the
+    deploy starts a second instance that polls Telegram alongside the first for
+    the sixty seconds before the old one is signalled to stop. Two pollers
+    split the update stream, so roughly half the grader's messages are answered
+    by an instance whose replies nobody is reading. Turn auto deploy off in the
+    host's settings as well: the skip phrase is the belt, that is the braces.
+    """
     if not (GH_TOKEN and GH_REPO) or not LOG_PATH.exists():
         return
     global _gh_sha
@@ -175,7 +185,7 @@ def publish_log():
                 r = requests.get(api, headers=hdrs, params={"ref": GH_BRANCH}, timeout=30)
                 if r.status_code == 200:
                     _gh_sha = r.json().get("sha")
-            body = {"message": "update run log",
+            body = {"message": "update run log [skip render]",
                     "content": base64.b64encode(LOG_PATH.read_bytes()).decode(),
                     "branch": GH_BRANCH}
             if _gh_sha:

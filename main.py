@@ -12,6 +12,7 @@ Environment variables required:
   PUBLIC_BASE_URL    : e.g. https://myagent.onrender.com  (no trailing slash)
 """
 
+import collections
 import json
 import math
 import os
@@ -1145,10 +1146,34 @@ def handle(chat_id, text):
     publish_log()   # after replying, so it never delays the answer
 
 
+# Every update Telegram has already delivered to this process, by message id.
+# Telegram redelivers an update whose offset was never confirmed, which happens
+# whenever a poll succeeds but the next one fails before acknowledging it. A
+# redelivered message would be answered twice, and a second reply is worse than
+# a wrong one: the harness reads one reply per message sent, so the extra is
+# consumed as the answer to the NEXT question and every reply after it shifts
+# by one. Bounded so a long run cannot grow it without limit.
+SEEN_UPDATES = collections.OrderedDict()
+SEEN_LIMIT = 500
+
+
+def already_handled(chat_id, message_id):
+    if message_id is None:
+        return False
+    key = (chat_id, message_id)
+    if key in SEEN_UPDATES:
+        return True
+    SEEN_UPDATES[key] = True
+    while len(SEEN_UPDATES) > SEEN_LIMIT:
+        SEEN_UPDATES.popitem(last=False)
+    return False
+
+
 def poll_loop():
     offset = None
     started = time.time()
-    log("boot", log_url=LOG_URL, model=MODEL, chain=model_candidates())
+    log("boot", log_url=LOG_URL, model=MODEL, chain=model_candidates(),
+        base_url=LLM_BASE_URL)
     while True:
         try:
             r = requests.get(f"{API}/getUpdates",
@@ -1162,6 +1187,13 @@ def poll_loop():
                 # consumed as the reply to their NEXT question.
                 if msg.get("date", 0) < started - 90:
                     log("stale_skipped", chat_id=(msg.get("chat") or {}).get("id"),
+                        text=(text or "")[:120])
+                    continue
+                if already_handled((msg.get("chat") or {}).get("id"),
+                                   msg.get("message_id")):
+                    log("duplicate_skipped",
+                        chat_id=(msg.get("chat") or {}).get("id"),
+                        message_id=msg.get("message_id"),
                         text=(text or "")[:120])
                     continue
                 if text and text.strip() != "/start":

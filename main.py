@@ -449,33 +449,33 @@ EVIDENCE RULES (most important):
    means the RATIO, the widely reported headline figure. If the column you
    read has a maximum below 40 you are in the wrong column: find the other.
 9. Statistical bulletins are REISSUED every year and the ranking changes
-   between editions. Establish which edition you are reading before you
-   trust it, and always prefer the newest. The SRS Special Bulletin on
-   Maternal Mortality has editions 2017-19, 2018-20, 2019-21, 2020-22,
-   2021-23 and 2022-24. Assam led the older editions and no longer does.
-   If the source you found is more than one edition behind the newest one
-   you can find, search again with the newer period in the query before
-   answering. Never answer a "which is highest" question from a news
-   summary of an old bulletin.
+   between editions. Establish which edition you are reading before you trust
+   it, and always prefer the newest one you can find. The SRS Special Bulletin
+   on Maternal Mortality has editions including 2017-19, 2018-20, 2019-21,
+   2020-22, 2021-23 and 2022-24, and the leading state is NOT the same in all
+   of them. Assam led the older editions and no longer does. If the source you
+   found is more than one edition behind the newest you can see referenced,
+   search again with the newer period in the query before answering. Never
+   answer a "which is highest" question from a news summary of an old edition.
 10. Indian statistics questions mean INDIAN states. Always put "India" in your
    search queries or you will get United States data. Try mospi.gov.in, data.gov.in, the Sample
    Registration System bulletins, PIB releases, and their PDF reports.
 
 OUTPUT RULES:
-10. Your FINAL message must be exactly one JSON object and nothing else.
+11. Your FINAL message must be exactly one JSON object and nothing else.
     No prose, no markdown fences, no explanation, no greeting.
-11. COPY the JSON shape from the message, key for key. Use the exact key names
+12. COPY the JSON shape from the message, key for key. Use the exact key names
     it shows. If it asks for {{"sorted": [...]}} the key is "sorted", not
     "sorted_values" and not a name you invent. Never add keys it did not ask
     for. If, and only if, the shape it shows contains "log_url", include
     "log_url" with this value: {LOG_URL}
-12. NEVER answer with N/A, null, unknown, empty strings or angle brackets.
+13. NEVER answer with N/A, null, unknown, empty strings or angle brackets.
     If you are unsure, commit to your single most likely answer. An unanswered
     question scores the same as a wrong one, so guessing strictly dominates.
-13. Numbers must be JSON numbers, not strings, unless strings were asked for.
+14. Numbers must be JSON numbers, not strings, unless strings were asked for.
     Round exactly as the message asks. If it does not say, and the value is
     not a whole number, give one decimal place.
-14. If several messages were sent, answer ONLY the final one. Earlier messages
+15. If several messages were sent, answer ONLY the final one. Earlier messages
     are background for it, never the question itself.
 """
 
@@ -499,7 +499,13 @@ def solve(history, run_id, max_steps=12, time_budget=100):
     # computing over it. It must NOT fire when the message already carries its
     # own data, or an inline arithmetic question is forced onto the web and
     # comes back with an answer to a different question entirely.
-    need_source = needs_external_data(" ".join(history))
+    # The gate only guards the graded answer. An intermediate turn of a multi
+    # turn exchange ("I am going to give you some data, acknowledge briefly")
+    # states no output shape, is never the reply that gets graded, and has
+    # nothing to research, so forcing a search on it only burns shared budget.
+    need_source = (bool(history)
+                   and is_task_terminus(history[-1])
+                   and needs_external_data(" ".join(history)))
     grounded = False  # True once a real source has been retrieved
     deadline = time.time() + time_budget
     seen_calls = {}   # (tool, args) -> how many times already made
@@ -605,33 +611,59 @@ DATASET_HINTS = ("mospi", "data.gov.in", "census", "http://", "https://",
                  "niti", "sample registration", "srs ", "public data")
 
 
+# A year or a reporting period is not data. "between the 2014-16 period and
+# the 2019-21 period" contains four numerals and zero figures to compute over,
+# so periods are removed before anything is counted.
+PERIOD_RE = re.compile(r"\b(?:19|20)\d{2}(?:\s*[-\u2013\u2014/]\s*\d{2,4})?\b")
+
+# A thousands separated figure is one number, not two.
+NUMBER_RE = re.compile(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?")
+
+MIN_INLINE_NUMBERS = 2
+
+
 def _payload(text):
-    """The question with its output template stripped off.
+    """The question with its output template and its date periods stripped.
 
     The template ("Reply with ONLY {"mean": <number>}") is boilerplate present
-    in every message, so counting digits without removing it first would count
-    the template's own placeholders.
+    in every message, so counting numerals without removing it first would
+    count the template's own placeholders.
     """
-    return TEMPLATE_RE.split(text)[0]
+    return PERIOD_RE.sub(" ", TEMPLATE_RE.split(text)[0])
 
 
 def has_inline_data(text):
-    """True when the message hands over enough numbers to be self contained.
+    """True when the message hands over figures to compute over.
 
-    Four is the threshold: a lookup question ("highest maternal mortality rate
-    based on MOSPI data") carries at most a year or two, while a compute
-    question carries a whole list.
+    Two is the threshold. One number is usually incidental ("the top three",
+    "per 1,000 women"); two or more that survive period stripping means the
+    message is carrying its own data. Every lookup question in the eval suite
+    reduces to zero numbers once periods are removed, so the margin is wide.
     """
-    return len(re.findall(r"-?\d+(?:\.\d+)?", _payload(text))) >= 4
+    return len(NUMBER_RE.findall(_payload(text))) >= MIN_INLINE_NUMBERS
 
 
 def needs_external_data(text):
-    """Whether this question requires the web. Naming a source always wins:
-    a question can quote a few figures and still point at a dataset."""
+    """Whether this question requires the web.
+
+    Ordered so the strongest signal wins:
+
+    1. An explicit URL is an instruction to go and read that document, even
+       when figures are quoted alongside it.
+    2. Otherwise, inline figures settle it. This deliberately overrides a
+       mention of MOSPI or a bulletin, because "these values come from a MOSPI
+       bulletin and are reproduced here: [...]" is an arithmetic question
+       wearing a dataset's name, and sending it to a search engine wastes the
+       budget and invites an answer to a different question.
+    3. With no URL and no figures, assume it must be looked up. Naming a
+       source is then only confirmation, not the deciding factor.
+    """
     low = text.lower()
-    if any(h in low for h in DATASET_HINTS):
+    if "http://" in low or "https://" in low:
         return True
-    return not has_inline_data(text)
+    if has_inline_data(text):
+        return False
+    return True
 
 
 def is_task_terminus(text):
@@ -648,11 +680,11 @@ def is_task_terminus(text):
 def references_prior(text):
     """True when a message points back at data sent in an earlier turn.
 
-    Carrying its own data or naming its own source both settle it: the message
-    is self sufficient and cannot be a continuation.
+    A message that carries its own figures, names its own source, or supplies
+    a URL is self sufficient, so it cannot be a continuation of anything.
     """
-    if has_inline_data(text) or needs_external_data(text) is True and any(
-            h in text.lower() for h in DATASET_HINTS):
+    low = text.lower()
+    if has_inline_data(text) or any(h in low for h in DATASET_HINTS):
         return False
     return bool(PRIOR_RE.search(text)) or bool(CONT_RE.search(text))
 

@@ -130,39 +130,52 @@ for label, msg in [("mean", MEAN), ("sorted", SORTED), ("nested", NESTED),
                    ("given url", GIVEN_URL)]:
     check(f"shape parsed: {label}", m.requested_shape(msg) is not None, True)
 
-print("\n=== conform: reply matches the requested shape ===")
-check("bare stays bare",
-      m.conform({"mean": 329.4}, m.requested_shape(MEAN)), {"mean": 329.4})
+print("\n=== conform: shape mirrored, log_url always present ===")
+U = m.LOG_URL
+check("bare gains log_url",
+      m.conform({"mean": 329.4}, m.requested_shape(MEAN)),
+      {"mean": 329.4, "log_url": U})
 check("renamed key restored",
-      m.conform({"average": 329.4}, m.requested_shape(MEAN)), {"mean": 329.4})
+      m.conform({"average": 329.4}, m.requested_shape(MEAN)),
+      {"mean": 329.4, "log_url": U})
 check("invented list key restored",
       m.conform({"sorted_values": [3, 2, 1]}, m.requested_shape(SORTED)),
-      {"sorted": [3, 2, 1]})
-check("unrequested envelope stripped",
+      {"sorted": [3, 2, 1], "log_url": U})
+check("unrequested envelope unwrapped, log_url kept",
       m.conform({"answer": {"mean": 329.4}, "log_url": "x"},
                 m.requested_shape(MEAN)),
-      {"mean": 329.4})
-check("envelope added when requested",
+      {"mean": 329.4, "log_url": U})
+check("envelope built when requested",
       m.conform({"sum": 276}, m.requested_shape(WRAP_OBJ)),
-      {"answer": {"sum": 276}, "log_url": m.LOG_URL})
+      {"answer": {"sum": 276}, "log_url": U})
 check("model written url replaced",
       m.conform({"answer": {"sum": 276}, "log_url": "https://fake.example"},
                 m.requested_shape(WRAP_OBJ)),
-      {"answer": {"sum": 276}, "log_url": m.LOG_URL})
+      {"answer": {"sum": 276}, "log_url": U})
+check("stray log_url not nested into answer",
+      m.conform({"sum": 276, "log_url": "https://fake.example"},
+                m.requested_shape(WRAP_OBJ)),
+      {"answer": {"sum": 276}, "log_url": U})
 check("scalar answer envelope",
       m.conform({"answer": 30, "log_url": "x"},
                 m.requested_shape(WRAP_SCALAR)),
-      {"answer": 30, "log_url": m.LOG_URL})
-check("multi key reply untouched",
+      {"answer": 30, "log_url": U})
+check("scalar answer rewrapped from bare",
+      m.conform({"answer": 30}, m.requested_shape(WRAP_SCALAR)),
+      {"answer": 30, "log_url": U})
+check("multi key reply keeps all keys",
       m.conform({"min": 1, "max": 9, "n": 3},
                 m.requested_shape('x ' + TAIL + '{"min": <n>, "max": <n>, "n": <n>}')),
-      {"min": 1, "max": 9, "n": 3})
+      {"min": 1, "max": 9, "n": 3, "log_url": U})
 check("nested reply untouched",
       m.conform({"stats": {"mean": 90.0, "spread": 80}},
                 m.requested_shape(NESTED)),
-      {"stats": {"mean": 90.0, "spread": 80}})
-check("no template means no reshaping",
-      m.conform({"anything": 1}, None), {"anything": 1})
+      {"stats": {"mean": 90.0, "spread": 80}, "log_url": U})
+check("no template still gains log_url",
+      m.conform({"anything": 1}, None), {"anything": 1, "log_url": U})
+check("log_url is never renamed as the payload key",
+      m.conform({"state": "Odisha"}, m.requested_shape(MMR)),
+      {"state": "Odisha", "log_url": U})
 
 print("\n=== placeholder rejection ===")
 for label, obj in [("null value", {"state": None}),

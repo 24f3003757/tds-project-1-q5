@@ -6,6 +6,11 @@ deadline. Twenty-nine grade automatically; nine are marked `MANUAL_CHECK`
 because their answers either move with the data or cannot be expressed as an
 exact match.
 
+Every expected answer includes a top level `log_url`, matching the course
+guidance that `log_url` should be present on every reply. If that guidance
+changes, flip `ALWAYS_INCLUDE_LOG_URL` in `main.py` and strip `log_url` back
+out of the keys here.
+
 Run them:
 
 ```bash

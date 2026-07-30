@@ -467,8 +467,11 @@ OUTPUT RULES:
 12. COPY the JSON shape from the message, key for key. Use the exact key names
     it shows. If it asks for {{"sorted": [...]}} the key is "sorted", not
     "sorted_values" and not a name you invent. Never add keys it did not ask
-    for. If, and only if, the shape it shows contains "log_url", include
-    "log_url" with this value: {LOG_URL}
+    for, with ONE exception: always include "log_url" with this value:
+    {LOG_URL}
+    If the shape it shows already has "answer" and "log_url", put your result
+    inside "answer". Otherwise keep the keys it asked for at the top level and
+    add "log_url" beside them.
 13. NEVER answer with N/A, null, unknown, empty strings or angle brackets.
     If you are unsure, commit to your single most likely answer. An unanswered
     question scores the same as a wrong one, so guessing strictly dominates.
@@ -689,38 +692,66 @@ def references_prior(text):
     return bool(PRIOR_RE.search(text)) or bool(CONT_RE.search(text))
 
 
-def conform(obj, template):
-    """Force the reply into the exact shape the message asked for.
+# Course guidance (Discourse thread "Project 1 clarification regarding log_url
+# in Question 5"): the worked example in the portal shows the
+# {"answer": ..., "log_url": ...} envelope, while the grading repo's README
+# shows a bare object. The TA who wrote the grader confirmed both formats will
+# be accepted in the real evaluation, and when asked directly whether log_url
+# should be included on questions that do not ask for it, answered "Please
+# Include log_url".
+#
+# So log_url is always sent. Where the question asked for the envelope it goes
+# inside it; where the question asked for a bare object it rides alongside the
+# requested keys as a sibling, leaving those keys untouched. Set this to False
+# to go back to mirroring the question exactly, which is what the public
+# pipeline's exact match comparison wants.
+ALWAYS_INCLUDE_LOG_URL = True
 
-    The grader parses the whole reply and compares it to the expected answer
-    with ==, so a correct value inside the wrong wrapper scores zero. Some
-    messages ask for a bare object, others for the {"answer": ..., "log_url":
-    ...} envelope. Mirror whichever the message showed rather than guessing.
+
+def conform(obj, template):
+    """Force the reply into the shape the message asked for, plus log_url.
+
+    The grader parses the whole reply and compares it to the expected answer,
+    so a correct value in the wrong wrapper scores zero. Two shapes are in
+    play. Some messages show the {"answer": ..., "log_url": ...} envelope and
+    others show a bare object; the envelope is used when and only when the
+    message showed one.
     """
-    if not isinstance(template, dict) or not isinstance(obj, dict):
+    if not isinstance(obj, dict):
         return obj
 
-    want_env = "log_url" in template and "answer" in template
-    has_env = "log_url" in obj and "answer" in obj
+    if isinstance(template, dict):
+        want_env = "log_url" in template and "answer" in template
+        has_env = "log_url" in obj and "answer" in obj
 
-    if want_env:
-        inner = obj["answer"] if has_env else obj
-        # log_url is written by us, never by the model, which fabricates URLs.
-        return {"answer": inner, "log_url": LOG_URL}
+        if want_env:
+            if "answer" in obj:
+                # Already wrapped, whether or not the model added log_url.
+                inner = obj["answer"]
+            else:
+                inner = {k: v for k, v in obj.items() if k != "log_url"}
+            # log_url is written here, never by the model, which invents URLs.
+            return {"answer": inner, "log_url": LOG_URL}
 
-    if has_env:                      # envelope sent but not requested: unwrap
-        inner = obj["answer"]
-        obj = inner if isinstance(inner, dict) else obj
-        if not isinstance(obj, dict):
-            return obj
+        if has_env:                  # envelope sent but not requested: unwrap
+            inner = obj["answer"]
+            if not isinstance(inner, dict):
+                return {"answer": inner, "log_url": LOG_URL}
+            obj = inner
 
-    # Single key template and a single key reply: the model renamed the key.
-    # The value is what was computed, so keep it and restore the asked-for name.
-    if len(template) == 1 and len(obj) == 1:
-        want, got = next(iter(template)), next(iter(obj))
-        if want != got:
-            return {want: obj[got]}
+        # Single key template and single key reply: the model renamed the key.
+        # The computed value is kept and the asked-for name restored. log_url
+        # is excluded from the count so it never looks like the payload key.
+        core_t = {k: v for k, v in template.items() if k != "log_url"}
+        core_o = {k: v for k, v in obj.items() if k != "log_url"}
+        if len(core_t) == 1 and len(core_o) == 1:
+            want, got = next(iter(core_t)), next(iter(core_o))
+            if want != got:
+                core_o = {want: core_o[got]}
+        obj = dict(core_o)
 
+    if ALWAYS_INCLUDE_LOG_URL:
+        obj["log_url"] = LOG_URL
     return obj
 
 

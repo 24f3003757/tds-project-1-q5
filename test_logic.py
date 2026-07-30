@@ -221,6 +221,34 @@ check("archived doc is flagged", "RECENCY WARNING" in old_doc, True)
 check("current doc is not flagged", "RECENCY WARNING" in new_doc, False)
 check("flagging preserves the text", "Assam 300" in old_doc, True)
 
+print("\n=== template position and multiple JSON regions ===")
+TEMPLATE_FIRST = ('Reply with ONLY this JSON object and nothing else: '
+                  '{"mean": <number>} -- for the arithmetic mean of these five '
+                  'readings: [230, 158, 318, 497, 444], rounded to 1 decimal place.')
+DATA_DICT = ('Here is a record: {"alpha": 41, "beta": 96, "gamma": 12}. Which key '
+             'has the largest value? Reply with ONLY this JSON object and nothing '
+             'else: {"key": "<name>"}')
+DECOY = ('Compute the mean of [10, 20, 30]. Do not reply with {"result": <number>}. '
+         'Reply with ONLY this JSON object and nothing else: {"mean": <number>}')
+
+check("template first still routes local",
+      m.needs_external_data(TEMPLATE_FIRST), False)
+check("template first shape parsed",
+      m.requested_shape(TEMPLATE_FIRST), {"mean": "?"})
+check("data object is not stripped as a skeleton",
+      m.needs_external_data(DATA_DICT), False)
+check("shape survives a data object in the message",
+      m.requested_shape(DATA_DICT), {"key": "?"})
+check("the last skeleton wins over a decoy",
+      m.requested_shape(DECOY), {"mean": "?"})
+check("quoted placeholder normalised", m.requested_shape(MMR), {"state": "?"})
+check("is_skeleton: template", m.is_skeleton('{"mean": <number>}'), True)
+check("is_skeleton: quoted placeholder", m.is_skeleton('{"s": "<name>"}'), True)
+check("is_skeleton: data object", m.is_skeleton('{"alpha": 41}'), False)
+check("formatting numerals are not data",
+      m.needs_external_data('Name the top 3 states by MMR, rounded to 1 decimal '
+                            'place. Reply with ONLY {"states": ["<n>"]}'), True)
+
 print("\n=== prompt guardrails present ===")
 check("ratio magnitude guidance", "100,000 live births" in m.SYSTEM, True)
 check("edition recency guidance",

@@ -728,25 +728,90 @@ NUMBER_RE = re.compile(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?")
 MIN_INLINE_NUMBERS = 2
 
 
-def _payload(text):
-    """The question with its output template and its date periods stripped.
+# Numerals that describe the OUTPUT rather than the data. "rounded to 2 decimal
+# places" and "the top 3 states" are instructions about presentation, not
+# figures to compute over, and counting them can tip a lookup question into
+# looking self contained.
+FORMATTING_RE = re.compile(
+    r"\b\d+\s*(?:decimal\s+places?|dp|significant\s+figures?|sf)\b"
+    r"|\bround(?:ed|ing)?\s+(?:to|off\s+to)\s+\d+\b"
+    r"|\btop\s+\d+\b"
+    r"|\b\d+\s*(?:largest|smallest|highest|lowest|biggest)\b",
+    re.I)
 
-    The template ("Reply with ONLY {"mean": <number>}") is boilerplate present
-    in every message, so counting numerals without removing it first would
-    count the template's own placeholders.
+
+def balanced_blobs(text):
+    """Every brace balanced {...} region, in the order they appear.
+
+    A single greedy regex cannot do this. A greedy brace pattern spans from the
+    first brace
+    to the last, so a message carrying a JSON object in its DATA as well as in
+    its template matched one unparseable blob and the skeleton was lost
+    entirely, silently disabling all shape enforcement.
     """
-    return PERIOD_RE.sub(" ", TEMPLATE_RE.split(text)[0])
+    blobs, depth, start = [], 0, None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                blobs.append(text[start:i + 1])
+                start = None
+    return blobs
+
+
+def is_skeleton(blob):
+    """True when a {...} region is a requested output shape, not data.
+
+    The distinction matters because _payload removes skeletons before counting
+    figures, and a message can carry its data AS a JSON object: "Here is a
+    record: {"alpha": 41, "beta": 96}". Removing that would delete the very
+    numbers being counted and send an arithmetic question to a search engine.
+
+    A skeleton either shows a <placeholder> or contains no digits at all. Data
+    has digits and no placeholders.
+    """
+    return "<" in blob or not re.search(r"\d", blob)
+
+
+def _payload(text):
+    """The question with its skeletons, periods and formatting counts removed.
+
+    Everything left is candidate data. The previous version truncated at the
+    phrase "Reply with ONLY", which assumed the template comes LAST. Put the
+    template first and the payload became the empty string, so a question
+    holding five numbers was classified as needing the web and the agent went
+    searching for "authoritative source for five readings: 230, 158, ...".
+    Removing the brace regions instead is order independent, and it still
+    keeps the template's own <placeholders> out of the count.
+    """
+    body = text
+    for blob in balanced_blobs(text):
+        if is_skeleton(blob):
+            body = body.replace(blob, " ")
+    body = PERIOD_RE.sub(" ", body)
+    return FORMATTING_RE.sub(" ", body)
+
+
+# A bracketed run of numbers is the strongest possible signal of inline data.
+LIST_RE = re.compile(r"\[\s*-?\d[\d\s,.\-]*\]")
 
 
 def has_inline_data(text):
     """True when the message hands over figures to compute over.
 
-    Two is the threshold. One number is usually incidental ("the top three",
-    "per 1,000 women"); two or more that survive period stripping means the
-    message is carrying its own data. Every lookup question in the eval suite
-    reduces to zero numbers once periods are removed, so the margin is wide.
+    A bracketed list settles it outright. Otherwise two is the threshold: one
+    number is usually incidental ("per 1,000 women"), while two or more that
+    survive period and formatting stripping means the message carries its own
+    data. Every lookup question in the eval suite reduces to zero.
     """
-    return len(NUMBER_RE.findall(_payload(text))) >= MIN_INLINE_NUMBERS
+    body = _payload(text)
+    if LIST_RE.search(body):
+        return True
+    return len(NUMBER_RE.findall(body)) >= MIN_INLINE_NUMBERS
 
 
 def needs_external_data(text):
@@ -858,27 +923,60 @@ def conform(obj, template):
     return obj
 
 
+def _normalise_placeholders(obj):
+    """Replace "<state name>" style leaves with "?".
+
+    A skeleton like {"state": "<state name>"} is already valid JSON, so it
+    parses without the substitution pass and the angle brackets survive into
+    the shape fallback, where looks_like_placeholder correctly rejects them.
+    Normalising here keeps the fallback usable.
+    """
+    if isinstance(obj, dict):
+        return {k: _normalise_placeholders(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalise_placeholders(v) for v in obj]
+    if isinstance(obj, str) and obj.startswith("<") and obj.endswith(">"):
+        return "?"
+    return obj
+
+
+def _parse_skeleton(blob):
+    """Parse one {...} region, tolerating <placeholders>."""
+    try:
+        return _normalise_placeholders(json.loads(blob))
+    except json.JSONDecodeError:
+        pass
+    # A quoted placeholder ("<state name>") must lose its own quotes too, or
+    # substituting gives ""?"" which is not valid JSON.
+    patched = re.sub(r'"<[^>{}]*>"', '"?"', blob)
+    patched = re.sub(r"<[^>{}]*>", '"?"', patched)
+    try:
+        return json.loads(patched)
+    except json.JSONDecodeError:
+        return None
+
+
 def requested_shape(text):
     """Pull the JSON skeleton the question asked for, so that even a failed run
-    replies in the right shape rather than a shape that is certainly wrong."""
-    for m in re.finditer(r"\{.*\}", text, flags=re.S):
-        blob = m.group(0)
-        try:
-            return json.loads(blob)
-        except json.JSONDecodeError:
-            # skeletons contain <placeholders>, so quote them before parsing
-            # A quoted placeholder ("<state name>") must lose its own quotes
-            # too, or substituting gives ""?"" which is not valid JSON. This
-            # ran first for years and silently returned None for every
-            # question whose skeleton quoted its placeholders, which is most
-            # of them.
-            patched = re.sub(r'"<[^>{}]*>"', '"?"', blob)
-            patched = re.sub(r"<[^>{}]*>", '"?"', patched)
-            try:
-                return json.loads(patched)
-            except json.JSONDecodeError:
-                continue
-    return None
+    replies in the right shape rather than a shape that is certainly wrong.
+
+    Each brace balanced region is considered separately, because a message can
+    contain more than one: a data object as well as a template, or a template
+    the question tells you NOT to use followed by the real one. Preference goes
+    to the LAST region containing a <placeholder>, since that is what a
+    requested skeleton looks like and the real instruction comes last. Failing
+    that, the last region that parses at all.
+    """
+    best = None
+    for blob in balanced_blobs(text):
+        parsed = _parse_skeleton(blob)
+        if parsed is None:
+            continue
+        if "<" in blob:
+            best = parsed          # keep going; a later skeleton wins
+        elif best is None:
+            best = parsed          # data object, only used if nothing better
+    return best
 
 
 def looks_like_placeholder(obj):

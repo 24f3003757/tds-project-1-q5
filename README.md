@@ -46,13 +46,31 @@ dataset's name, and sending it to a search engine wastes the budget and invites
 an answer to a different question. With no URL and no figures, the question is
 assumed to need looking up.
 
-Counting figures needs two refinements to be trustworthy. Reporting periods are
-stripped first, because "between the 2014-16 period and the 2019-21 period"
-contains four numerals and no data. Thousands separated values are matched as
-one number rather than two, so "per 100,000 live births" does not read as a
-pair of figures. After those, every lookup question in the eval suite reduces to
-zero numbers and every computation question keeps at least two, which is where
-the threshold sits.
+Counting figures needs several refinements to be trustworthy, each of which
+came from a message that defeated the previous version.
+
+Reporting periods are stripped, because "between the 2014-16 period and the
+2019-21 period" contains four numerals and no data. Thousands separated values
+match as one number, so "per 100,000 live births" is not a pair of figures.
+Formatting counts are stripped too: "rounded to 2 decimal places" and "the top
+3 states" describe the output, not the input, and two of them together were
+enough to make a lookup question look self contained.
+
+Output skeletons are removed before counting, since a template's own
+`<number>` placeholders are not data. Crucially they are removed *wherever they
+appear*, not by truncating at the phrase "Reply with ONLY". That truncation
+assumed the template comes last; a message that opened with its template left
+an empty payload, so a question holding five numbers was classified as needing
+the web and the agent went searching for "authoritative source for five
+readings: 230, 158, ...". It reached the right answer only because the figures
+were in its context anyway.
+
+The removal is selective, because a message can carry its data *as* a JSON
+object: "Here is a record: {"alpha": 41, "beta": 96}". A region is treated as a
+skeleton only if it shows a placeholder or contains no digits at all; a region
+with digits and no placeholders is data and is kept. And a bracketed run of
+numbers short circuits the whole count, since `[230, 158, 318]` is not
+ambiguous.
 
 **Task boundary detection.** A grader sends its next question seconds after
 receiving the previous reply, so elapsed time cannot distinguish a new question
@@ -142,10 +160,22 @@ known filler strings; when it fires, the model gets one more call demanding a
 commitment.
 
 **Shape aware fallback.** If everything fails, the JSON skeleton is parsed out
-of the question itself so the reply at least matches the requested shape. The
-skeleton parser strips the quotes around a quoted placeholder before
-substituting, since `"<state name>"` would otherwise substitute to `""?""`,
-which is not valid JSON.
+of the question itself so the reply at least matches the requested shape.
+
+Finding that skeleton needs brace matching rather than a regex. A greedy brace
+pattern spans from the first brace in the message to the last, so any message
+containing a second JSON region matched one unparseable blob and the skeleton
+was lost entirely, silently disabling every downstream shape correction. Each
+balanced region is therefore scanned separately, and preference goes to the last
+one containing a placeholder, so a decoy ("do not reply with {...}") loses to
+the real instruction that follows it.
+
+Two placeholder forms are handled. An unquoted `<number>` is substituted before
+parsing. A quoted `"<state name>"` must lose its surrounding quotes as well, or
+the substitution produces `""?""`, which is not valid JSON; and because that
+form is already valid JSON it parses without substitution at all, so the angle
+brackets are normalised away afterwards to keep the fallback usable rather than
+self rejecting.
 
 **Model fallback chain.** Every model call walks `MODEL_CHAIN` until one
 returns. A single point of failure on the primary model is unusually damaging

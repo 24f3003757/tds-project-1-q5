@@ -102,6 +102,22 @@ repeat is not executed; the model instead receives a message stating the call
 was already made and listing concrete alternatives. Without this the agent can
 spend its entire budget repeating one fruitless call.
 
+**Automatic recency detection.** A ranking question over an annually reissued
+dataset is a recency question in disguise, and the model cannot tell a current
+bulletin from an archived one by looking at it: both are official, both sit on
+a .gov.in host, both contain a well formed table. Left to judgement it will
+happily read *Women & Men In India 2016*, whose newest column is 2011-13, and
+report the leader from fourteen year old figures.
+
+So the age is measured rather than judged. Every fetched document is scanned
+for the most recent year it references, counting both bare years and period
+spans such as `2019-21` (a two digit tail is expanded against the century of
+its start, so `1998-02` resolves to 2002). If that maximum falls below
+`DATA_RECENCY_FLOOR`, the document is returned with a recency warning attached
+and a `stale_document` event is logged. `search_document` repeats the warning,
+since it reads from the cache and would otherwise launder an archived table
+back in without it.
+
 **Document abandonment.** After three unsuccessful probes into the same URL,
 the result carries a note that the figures are probably chart images and the
 document should be dropped. Several MOSPI publications store state level data
@@ -177,7 +193,13 @@ Render web service.
 - Build: `pip install -r requirements.txt`
 - Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Environment: `TELEGRAM_BOT_TOKEN`, `OPENROUTER_TOKEN`, `TAVILY_TOKEN`,
-  `PUBLIC_BASE_URL`, optionally `MODEL`, `MODEL_CHAIN` and `MAX_TOKENS`
+  `PUBLIC_BASE_URL`, optionally `LLM_BASE_URL`, `MODEL`, `MODEL_CHAIN`,
+  `DATA_RECENCY_FLOOR` and `MAX_TOKENS`
+
+`LLM_BASE_URL` defaults to `https://aipipe.org/openrouter/v1`, the course
+proxy, which speaks the OpenAI protocol and forwards to OpenRouter.
+`OPENROUTER_TOKEN` holds whichever token matches that base URL. Set
+`LLM_BASE_URL=https://openrouter.ai/api/v1` to call OpenRouter directly.
 
 An UptimeRobot monitor pings `/` every five minutes so the free instance never
 idles into a cold start, which would otherwise consume most of a question's

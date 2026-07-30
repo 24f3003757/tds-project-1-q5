@@ -202,6 +202,25 @@ check("nested json", m.extract_json_object('{"a": {"b": [1, 2]}}'),
       {"a": {"b": [1, 2]}})
 check("garbage returns None", m.extract_json_object("no json here"), None)
 
+print("\n=== document recency detection ===")
+for label, text, want in [
+        ("2016 publication", "Women & Men In India 2016 ... 2001-03 2011-13 Assam 300", 2016),
+        ("current PIB table", "SRS 2019-21 | SRS 2020-22 | SRS 2021-23 | Assam | 167", 2023),
+        ("span two digit tail", "period 2019-21 only", 2021),
+        ("century rollover", "1998-02", 2002),
+        ("newest edition", "2022-24", 2024),
+        ("no years", "no dates here", None),
+        ("future noise ignored", "row 9999 and 2021", 2021)]:
+    check(f"newest_year: {label}", m.newest_year(text), want)
+
+m.DOCS.clear()
+old_doc = m._store("http://x/old.pdf",
+                   "Women & Men In India 2016 ... 2011-13 Assam 300 Odisha 222")
+new_doc = m._store("http://x/new", "SRS 2021-23 Assam 110 Bihar 104")
+check("archived doc is flagged", "RECENCY WARNING" in old_doc, True)
+check("current doc is not flagged", "RECENCY WARNING" in new_doc, False)
+check("flagging preserves the text", "Assam 300" in old_doc, True)
+
 print("\n=== prompt guardrails present ===")
 check("ratio magnitude guidance", "100,000 live births" in m.SYSTEM, True)
 check("edition recency guidance",

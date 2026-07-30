@@ -6,7 +6,9 @@ Two things run in one process:
 
 Environment variables required:
   TELEGRAM_BOT_TOKEN : from @BotFather
-  OPENROUTER_TOKEN       : from https://openrouter.io
+  OPENROUTER_TOKEN       : AIPipe token (https://aipipe.org) or an
+                           OpenRouter key, matching LLM_BASE_URL
+  LLM_BASE_URL           : defaults to AIPipe's OpenRouter passthrough
   PUBLIC_BASE_URL    : e.g. https://myagent.onrender.com  (no trailing slash)
 """
 
@@ -45,8 +47,8 @@ MODEL = os.environ.get("MODEL", "openai/gpt-4o-mini")
 MODEL_CHAIN = [m.strip() for m in
                os.environ.get("MODEL_CHAIN",
                               "openai/gpt-4o-mini,"
-                              "meta-llama/llama-3.3-70b-instruct,"
-                              "google/gemini-2.0-flash-001").split(",")
+                              "google/gemini-2.0-flash-001,"
+                              "meta-llama/llama-3.3-70b-instruct").split(",")
                if m.strip()]
 
 
@@ -127,7 +129,12 @@ def publish_log():
         except Exception:
             _gh_sha = None
 
-client = OpenAI(api_key=OPENROUTER_TOKEN, base_url="https://openrouter.ai/api/v1")
+# AIPipe is the course's LLM proxy. It speaks the OpenAI protocol and forwards
+# to OpenRouter, so the only difference from calling OpenRouter directly is the
+# base URL and which token is accepted. Point LLM_BASE_URL at either one.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://aipipe.org/openrouter/v1")
+
+client = OpenAI(api_key=OPENROUTER_TOKEN, base_url=LLM_BASE_URL)
 
 # ----------------------------------------------------------------- logging
 
@@ -344,13 +351,61 @@ TABLES = {}   # url -> list of rendered tables (PDFs only)
 HEAD = 6000
 
 
+# A ranking question over an annually reissued dataset is a recency question in
+# disguise, and the model cannot tell a current bulletin from an archived one
+# by looking at it: both are official, both are on a .gov.in host, both contain
+# a well formed table. So the age is measured here instead of being left to
+# judgement. Anything whose newest reference predates this floor is flagged.
+DATA_RECENCY_FLOOR = int(os.environ.get("DATA_RECENCY_FLOOR", "2019"))
+
+PERIOD_SPAN_RE = re.compile(r"\b((?:19|20)\d{2})\s*[-\u2013\u2014/]\s*(\d{2,4})\b")
+PLAIN_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def newest_year(text):
+    """The most recent year referenced anywhere in a document.
+
+    Both forms count. A span like "2011-13" or "2019-21" resolves to its end
+    year, expanding a two digit tail against the century of its start. A bare
+    year counts as itself. Years beyond next year are ignored as parsing
+    noise, since statistical reports are full of stray digit runs.
+    """
+    ceiling = time.gmtime().tm_year + 1
+    years = []
+
+    for m in PERIOD_SPAN_RE.finditer(text):
+        start, tail = int(m.group(1)), m.group(2)
+        end = int(tail) if len(tail) == 4 else int(str(start)[:2] + tail.zfill(2))
+        if end < start:
+            end += 100          # "1998-02" means 2002, not 1902
+        years.append(end)
+
+    years += [int(m.group(0)) for m in PLAIN_YEAR_RE.finditer(text)]
+    years = [y for y in years if 1900 <= y <= ceiling]
+    return max(years) if years else None
+
+
 def _store(url, full):
     DOCS[url] = full
-    if len(full) <= HEAD:
-        return full
+
+    stale = ""
+    newest = newest_year(full)
+    if newest is not None and newest < DATA_RECENCY_FLOOR:
+        log("stale_document", url=url, newest_year=newest)
+        stale = (f"\n\n[RECENCY WARNING: the most recent year referenced anywhere "
+                 f"in this document is {newest}, so this is an ARCHIVED edition. "
+                 f"Rankings change between editions. Do NOT answer a 'which is "
+                 f"highest' or 'which is lowest' question from this document. "
+                 f"Run web_search again with a recent period in the query, such "
+                 f"as \"SRS maternal mortality bulletin 2021-23 state wise\", and "
+                 f"prefer pib.gov.in press releases or censusindia.gov.in, which "
+                 f"publish the current tables as text.]")
+
+    if len(full) + len(stale) <= HEAD:
+        return full + stale
     return (full[:HEAD] + f"\n\n[...truncated. This document is {len(full)} characters. "
             f"Use search_document with this url and a keyword such as a state name "
-            f"or a table heading to read the rest...]")
+            f"or a table heading to read the rest...]" + stale)
 
 
 def search_document(url: str, query: str) -> str:
@@ -391,6 +446,13 @@ def search_document(url: str, query: str) -> str:
     if not scored:
         return f"(no match for {query!r}. Try a single distinctive word.)"
 
+    stale = ""
+    newest = newest_year(full)
+    if newest is not None and newest < DATA_RECENCY_FLOOR:
+        stale = (f"\n\n[RECENCY WARNING: this document's most recent reference is "
+                 f"{newest}. It is an archived edition and must not be used for a "
+                 f"ranking question. Find a newer source.]")
+
     scored.sort(key=lambda x: -x[0])
     picked, out = [], []
     for score, start, chunk in scored:
@@ -400,7 +462,7 @@ def search_document(url: str, query: str) -> str:
         out.append(f"[offset {start}, score {score:.0f}]\n{chunk}")
         if len(out) >= 4:
             break
-    return "\n\n---\n\n".join(out)[:11000]
+    return "\n\n---\n\n".join(out)[:11000] + stale
 
 
 def read_tables(url: str) -> str:
@@ -496,6 +558,9 @@ EVIDENCE RULES (most important):
    found is more than one edition behind the newest you can see referenced,
    search again with the newer period in the query before answering. Never
    answer a "which is highest" question from a news summary of an old edition.
+   A document carrying a RECENCY WARNING is archived: do not answer a ranking
+   question from it under any circumstances, and do not copy its table into
+   run_python. Search again instead.
 10. Indian statistics questions mean INDIAN states. Always put "India" in your
    search queries or you will get United States data. Try mospi.gov.in, data.gov.in, the Sample
    Registration System bulletins, PIB releases, and their PDF reports.

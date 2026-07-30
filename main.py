@@ -848,16 +848,32 @@ def is_task_terminus(text):
     return bool(TEMPLATE_RE.search(text)) or requested_shape(text) is not None
 
 
-def references_prior(text):
+def references_prior(text, hist=None):
     """True when a message points back at data sent in an earlier turn.
 
     A message that carries its own figures, names its own source, or supplies
-    a URL is self sufficient, so it cannot be a continuation of anything.
+    a URL is self sufficient, so it cannot be a continuation of anything. That
+    test comes first and is decisive.
+
+    Otherwise an explicit cue settles it: "the same numbers", or an imperative
+    opener like "Now" or "Ignore". But a cue list can only ever be a list of
+    the phrasings someone thought of. "Give me the median too" is plainly a
+    follow up and matches nothing, and the cost of missing it is severe: the
+    history is cleared, the data from turn one is gone, and the agent goes to
+    the web to answer a question whose numbers it was handed two messages ago.
+
+    So there is a fallback that does not depend on vocabulary. A message with
+    no figures and no named source has nothing to work on by itself. If the
+    conversation so far contains data, that data is what the message must be
+    about. Consecutive independent lookups are unaffected, because a history
+    of lookups holds no inline data either, so it still resets between them.
     """
     low = text.lower()
     if has_inline_data(text) or any(h in low for h in DATASET_HINTS):
         return False
-    return bool(PRIOR_RE.search(text)) or bool(CONT_RE.search(text))
+    if PRIOR_RE.search(text) or CONT_RE.search(text):
+        return True
+    return bool(hist) and any(has_inline_data(h) for h in hist)
 
 
 # Course guidance (Discourse thread "Project 1 clarification regarding log_url
@@ -1066,7 +1082,7 @@ def _handle(chat_id, text):
     # message starts a fresh one unless it explicitly points back. Without this
     # the fifth graded question still has questions one to four sitting in the
     # prompt, and an inline mean question comes back as a state name.
-    if hist and is_task_terminus(hist[-1]) and not references_prior(text):
+    if hist and is_task_terminus(hist[-1]) and not references_prior(text, hist):
         log("task_boundary", run_id=run_id, chat_id=chat_id,
             closed=hist[-1][:120])
         hist.clear()

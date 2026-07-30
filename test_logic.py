@@ -249,6 +249,35 @@ check("formatting numerals are not data",
       m.needs_external_data('Name the top 3 states by MMR, rounded to 1 decimal '
                             'place. Reply with ONLY {"states": ["<n>"]}'), True)
 
+print("\n=== continuation without a cue word ===")
+def _seq(msgs):
+    hist, out = [], []
+    for msg in msgs:
+        if hist and m.is_task_terminus(hist[-1]) and not m.references_prior(msg, hist):
+            hist = []
+        hist.append(msg)
+        out.append(len(hist))
+    return out
+
+check("'Give me the median too' keeps the data",
+      _seq(["Data: [318, 502, 718, 205, 466, 133]",
+            'What is the mean? ' + TAIL + '{"mean": <number>}',
+            'Give me the median too. ' + TAIL + '{"median": <number>}']),
+      [1, 2, 3])
+check("independent lookups still reset",
+      _seq(['Which state has the highest MMR from MOSPI data? ' + TAIL + '{"state": "<n>"}',
+            'What is the national figure? ' + TAIL + '{"mmr": <number>}']),
+      [1, 1])
+check("independent inline questions still reset",
+      _seq(['Mean of [230, 158, 318, 497]? ' + TAIL + '{"mean": <number>}',
+            'Sort [194, 121, 110] descending. ' + TAIL + '{"sorted": [<n>]}']),
+      [1, 1])
+check("four turn follow up chain",
+      _seq(["Data: [10, 20, 30, 40]", 'Mean? ' + TAIL + '{"mean": <n>}',
+            'Median? ' + TAIL + '{"median": <n>}',
+            'And the range? ' + TAIL + '{"range": <n>}']),
+      [1, 2, 3, 4])
+
 print("\n=== prompt guardrails present ===")
 check("ratio magnitude guidance", "100,000 live births" in m.SYSTEM, True)
 check("edition recency guidance",

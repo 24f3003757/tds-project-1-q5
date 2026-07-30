@@ -278,6 +278,35 @@ check("four turn follow up chain",
             'And the range? ' + TAIL + '{"range": <n>}']),
       [1, 2, 3, 4])
 
+print("\n=== model tiering and fallback chain ===")
+
+
+def tier_for(msgs):
+    """Mirrors the tier decision inside solve()."""
+    need = (bool(msgs) and m.is_task_terminus(msgs[-1])
+            and m.needs_external_data(" ".join(msgs)))
+    return m.MODEL if need else m.CHEAP_MODEL
+
+
+check("inline question uses the cheap model", tier_for([MEAN]), m.CHEAP_MODEL)
+check("sort uses the cheap model", tier_for([SORTED]), m.CHEAP_MODEL)
+check("envelope question uses the cheap model", tier_for([WRAP_OBJ]), m.CHEAP_MODEL)
+check("multi turn inline uses the cheap model", tier_for([T1, T2, T3]), m.CHEAP_MODEL)
+check("MMR lookup uses the strong model", tier_for([MMR]), m.MODEL)
+check("given url uses the strong model", tier_for([GIVEN_URL]), m.MODEL)
+check("SDG lookup uses the strong model", tier_for([SDG]), m.MODEL)
+check("strong model leads its own chain", m.model_candidates()[0], m.MODEL)
+check("cheap model leads its own chain",
+      m.model_candidates(m.CHEAP_MODEL)[0], m.CHEAP_MODEL)
+check("no name is repeated in the chain",
+      len(m.model_candidates(m.CHEAP_MODEL)),
+      len(set(m.model_candidates(m.CHEAP_MODEL))))
+check("every fallback matches the provider in LLM_BASE_URL",
+      all(n.startswith("claude-") for n in m.model_candidates())
+      if "api.anthropic.com" in m.LLM_BASE_URL else True, True)
+check("base url ends in a slash so the SDK can append a path",
+      m.LLM_BASE_URL.endswith("/"), True)
+
 print("\n=== prompt guardrails present ===")
 check("ratio magnitude guidance", "100,000 live births" in m.SYSTEM, True)
 check("edition recency guidance",

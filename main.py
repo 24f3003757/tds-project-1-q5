@@ -4,12 +4,29 @@ Two things run in one process:
   1. a FastAPI app that serves the public JSONL run log at GET /run.jsonl
   2. a background thread that long polls Telegram and answers messages
 
-Environment variables required:
+Environment variables.
+
+Required:
   TELEGRAM_BOT_TOKEN : from @BotFather
-  OPENROUTER_TOKEN       : AIPipe token (https://aipipe.org) or an
-                           OpenRouter key, matching LLM_BASE_URL
-  LLM_BASE_URL           : defaults to AIPipe's OpenRouter passthrough
+  OPENROUTER_TOKEN   : the LLM key. Historic name, provider agnostic. With the
+                       defaults below this is an Anthropic key, sk-ant-...
   PUBLIC_BASE_URL    : e.g. https://myagent.onrender.com  (no trailing slash)
+
+LLM, all defaulted for the Claude API:
+  LLM_BASE_URL       : https://api.anthropic.com/v1/   (trailing slash needed)
+  MODEL              : strong model, drives retrieval questions
+  CHEAP_MODEL        : cheap model, drives inline arithmetic questions
+  MODEL_CHAIN        : comma separated fallbacks. Every name must exist on
+                       LLM_BASE_URL or each call 404s once per name.
+
+Strongly recommended:
+  TAVILY_TOKEN       : https://tavily.com free tier. Without it web_search
+                       falls back to scraping DuckDuckGo, which datacenter IPs
+                       are routinely blocked from, and retrieval answers die.
+  GITHUB_TOKEN       : fine grained PAT, Contents read and write, this repo
+  GITHUB_REPO        : e.g. 24f3003757/tds-project-1-q5. Setting both moves
+                       log_url onto raw.githubusercontent, which survives the
+                       host restarting and wiping its disk.
 """
 
 import collections
@@ -37,7 +54,14 @@ TAVILY_TOKEN = os.environ.get("TAVILY_TOKEN", "")
 BRAVE_TOKEN = os.environ.get("BRAVE_TOKEN", "")
 GOOGLE_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GOOGLE_CX = os.environ.get("GOOGLE_CX", "")
-MODEL = os.environ.get("MODEL", "openai/gpt-4o-mini")
+# The strong model. It drives the retrieval questions, where a 12 step tool
+# loop over government PDFs is the whole difficulty.
+MODEL = os.environ.get("MODEL", "claude-sonnet-5")
+
+# The cheap model. Most graded questions carry their own numbers in the message
+# and need no tools at all, so paying strong model rates to average six
+# integers is money burnt for no accuracy gain. solve() picks between the two.
+CHEAP_MODEL = os.environ.get("CHEAP_MODEL", "claude-haiku-4-5-20251001")
 
 # Fallback chain. Credit exhaustion, a rate limit or a provider outage on the
 # primary model would otherwise take every question down at once: solve() would
@@ -45,20 +69,23 @@ MODEL = os.environ.get("MODEL", "openai/gpt-4o-mini")
 # ship a skeleton full of "?" placeholders that is guaranteed to be marked
 # wrong. A cheaper model answering imperfectly beats no model answering at all,
 # so each call walks this list until one returns.
+#
+# Every name here MUST exist on whatever LLM_BASE_URL points at. A chain of
+# OpenRouter names against api.anthropic.com just 404s three times per call.
 MODEL_CHAIN = [m.strip() for m in
                os.environ.get("MODEL_CHAIN",
-                              "openai/gpt-4o-mini,"
-                              "google/gemini-2.0-flash-001,"
-                              "meta-llama/llama-3.3-70b-instruct").split(",")
+                              "claude-haiku-4-5-20251001,"
+                              "claude-sonnet-5").split(",")
                if m.strip()]
 
 
-def model_candidates():
+def model_candidates(primary=None):
     """The primary model first, then any fallback not equal to it."""
-    return [MODEL] + [m for m in MODEL_CHAIN if m != MODEL]
+    primary = primary or MODEL
+    return [primary] + [m for m in MODEL_CHAIN if m != primary]
 
 
-def complete(run_id=None, **kwargs):
+def complete(run_id=None, model=None, **kwargs):
     """client.chat.completions.create with a model fallback chain.
 
     Only the model is varied; everything else is passed through untouched. The
@@ -66,7 +93,7 @@ def complete(run_id=None, **kwargs):
     surface rather than being swallowed.
     """
     last = None
-    for i, name in enumerate(model_candidates()):
+    for i, name in enumerate(model_candidates(model)):
         try:
             resp = client.chat.completions.create(model=name, **kwargs)
             if i:
@@ -130,10 +157,33 @@ def publish_log():
         except Exception:
             _gh_sha = None
 
-# AIPipe is the course's LLM proxy. It speaks the OpenAI protocol and forwards
-# to OpenRouter, so the only difference from calling OpenRouter directly is the
-# base URL and which token is accepted. Point LLM_BASE_URL at either one.
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://aipipe.org/openrouter/v1")
+
+def restore_log():
+    """Pull the published log back down at boot.
+
+    The host's disk is ephemeral: every redeploy or idle restart gives us an
+    empty run.jsonl. Without this, a restart silently truncates the log the
+    graders download to whatever happened after the restart. Appending to the
+    restored copy keeps the whole history under one URL.
+    """
+    if not (GH_TOKEN and GH_REPO) or LOG_PATH.exists():
+        return
+    try:
+        r = requests.get(
+            f"https://raw.githubusercontent.com/{GH_REPO}/{GH_BRANCH}/{GH_PATH}",
+            timeout=30)
+        if r.status_code == 200 and r.text.strip():
+            LOG_PATH.write_text(r.text if r.text.endswith("\n") else r.text + "\n")
+    except Exception:
+        pass
+
+# Anthropic serves an OpenAI compatible endpoint, so the whole agent loop below
+# (tools=, tool_calls, role "tool") works unchanged against Claude models: only
+# the base URL, the key and the model names differ. The trailing slash matters,
+# because the OpenAI SDK appends "chat/completions" to whatever it is given.
+# AIPipe and OpenRouter also speak this protocol, so switching provider is
+# always these three environment variables and no code.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.anthropic.com/v1/")
 
 client = OpenAI(api_key=OPENROUTER_TOKEN, base_url=LLM_BASE_URL)
 
@@ -594,7 +644,13 @@ def solve(history, run_id, max_steps=12, time_budget=100):
     """Returns (final_text, convo) so the caller can push for a commitment."""
     """history is a list of the user's messages in this conversation."""
     convo = [{"role": "system", "content": SYSTEM}]
-    convo += [{"role": "user", "content": m} for m in history[:-1]]
+    # Prior turns go in as ONE user message, not one each. Claude's API enforces
+    # strict user/assistant alternation, so four consecutive user messages from
+    # a four turn question are rejected outright. Joining them changes nothing
+    # the model sees: the turns are still in order, still labelled background by
+    # the marker below.
+    if len(history) > 1:
+        convo.append({"role": "user", "content": "\n\n".join(history[:-1])})
     if history:
         # Naming the final message explicitly. A model given four bare user
         # turns will happily answer the most interesting one rather than the
@@ -614,6 +670,14 @@ def solve(history, run_id, max_steps=12, time_budget=100):
     need_source = (bool(history)
                    and is_task_terminus(history[-1])
                    and needs_external_data(" ".join(history)))
+
+    # Retrieval questions get the strong model, because the difficulty is a long
+    # tool loop over government PDFs. Inline arithmetic gets the cheap one: the
+    # numbers are already in the message and run_python does the actual work, so
+    # the extra capability buys nothing but cost.
+    tier = MODEL if need_source else CHEAP_MODEL
+    log("model_tier", run_id=run_id, model=tier, need_source=need_source)
+
     grounded = False  # True once a real source has been retrieved
     deadline = time.time() + time_budget
     seen_calls = {}   # (tool, args) -> how many times already made
@@ -622,7 +686,7 @@ def solve(history, run_id, max_steps=12, time_budget=100):
     for step in range(max_steps):
         if time.time() > deadline:
             break
-        resp = complete(run_id=run_id, messages=convo, tools=TOOLS,
+        resp = complete(run_id=run_id, model=tier, messages=convo, tools=TOOLS,
                         temperature=0, max_tokens=MAX_TOKENS)
         msg = resp.choices[0].message
         convo.append(msg.model_dump(exclude_none=True))
@@ -640,7 +704,31 @@ def solve(history, run_id, max_steps=12, time_budget=100):
 
         for call in msg.tool_calls:
             name = call.function.name
-            args = json.loads(call.function.arguments or "{}")
+
+            # The OpenAI compatibility layer ignores the "strict" flag, so the
+            # arguments are NOT guaranteed to match the schema we advertised.
+            # A KeyError or a JSONDecodeError here would escape solve(), lose
+            # the whole conversation and ship a shape_fallback. Hand the model
+            # back a readable error instead and let it retry the call.
+            if name not in DISPATCH:
+                log("bad_tool_name", run_id=run_id, step=step, tool=name)
+                convo.append({"role": "tool", "tool_call_id": call.id,
+                              "content": f"ERROR: there is no tool named {name}. "
+                                         f"Use one of: {', '.join(DISPATCH)}."})
+                continue
+            try:
+                args = json.loads(call.function.arguments or "{}")
+                if not isinstance(args, dict):
+                    raise ValueError("arguments must be a JSON object")
+            except Exception as e:
+                log("bad_tool_args", run_id=run_id, step=step, tool=name,
+                    raw=(call.function.arguments or "")[:300], error=repr(e))
+                convo.append({"role": "tool", "tool_call_id": call.id,
+                              "content": "ERROR: your arguments were not a valid "
+                                         "JSON object. Retry this call with valid "
+                                         "JSON."})
+                continue
+
             sig = (name, json.dumps(args, sort_keys=True))
             seen_calls[sig] = seen_calls.get(sig, 0) + 1
 
@@ -656,7 +744,15 @@ def solve(history, run_id, max_steps=12, time_budget=100):
                           "already have enough, give your final JSON answer.")
                 log("repeat_blocked", run_id=run_id, step=step, tool=name, args=args)
             else:
-                result = DISPATCH[name](**args)
+                try:
+                    result = DISPATCH[name](**args)
+                except Exception as e:
+                    result = (f"ERROR calling {name}: {type(e).__name__}: {e}. "
+                              f"Check the argument names and try again.")
+                    log("tool_error", run_id=run_id, step=step, tool=name,
+                        args=args, error=repr(e))
+                if not isinstance(result, str):
+                    result = str(result)
                 if name in ("web_search", "fetch_url") and not result.startswith("ERROR"):
                     grounded = True
 
@@ -680,8 +776,8 @@ def solve(history, run_id, max_steps=12, time_budget=100):
         "Time is up. Answer NOW using what you already retrieved. Reply with "
         "exactly one JSON object in the requested shape and nothing else."})
     try:
-        final = complete(run_id=run_id, messages=convo, temperature=0,
-                         max_tokens=MAX_TOKENS)
+        final = complete(run_id=run_id, model=tier, messages=convo,
+                         temperature=0, max_tokens=MAX_TOKENS)
         out = final.choices[0].message.content or ""
         log("forced_final", run_id=run_id, content=out)
         return out, convo
@@ -1172,8 +1268,13 @@ def already_handled(chat_id, message_id):
 def poll_loop():
     offset = None
     started = time.time()
-    log("boot", log_url=LOG_URL, model=MODEL, chain=model_candidates(),
-        base_url=LLM_BASE_URL)
+    log("boot", log_url=LOG_URL, model=MODEL, cheap_model=CHEAP_MODEL,
+        chain=model_candidates(), base_url=LLM_BASE_URL,
+        public_base_url=PUBLIC_BASE_URL,
+        search_engines=[n for n, on in (("tavily", TAVILY_TOKEN),
+                                        ("brave", BRAVE_TOKEN),
+                                        ("google", GOOGLE_KEY and GOOGLE_CX),
+                                        ("duckduckgo", True)) if on])
     while True:
         try:
             r = requests.get(f"{API}/getUpdates",
@@ -1219,4 +1320,5 @@ def health():
     return {"ok": True, "log_url": LOG_URL}
 
 
+restore_log()
 threading.Thread(target=poll_loop, daemon=True).start()

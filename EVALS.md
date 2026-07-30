@@ -2,23 +2,38 @@
 
 `evals/questions.json` holds 38 questions in four families. The graded
 questions are separate; these exist to exercise every code path before the
-deadline. Twenty-nine grade automatically; nine are marked `MANUAL_CHECK`
-because their answers either move with the data or cannot be expressed as an
-exact match.
+deadline. Thirty-one grade automatically; seven are marked `MANUAL_CHECK`
+because their answers move with the data and cannot be expressed as an exact
+match.
+
+The file is emitted by `make_questions.py` rather than hand written, because
+every expected answer embeds the bot's `log_url` and that URL has to be
+changed in one place:
+
+```bash
+python3 make_questions.py --log-url https://<your-host>/run.jsonl > evals/questions.json
+```
 
 Every expected answer includes a top level `log_url`, matching the course
 guidance that `log_url` should be present on every reply. If that guidance
-changes, flip `ALWAYS_INCLUDE_LOG_URL` in `main.py` and strip `log_url` back
-out of the keys here.
+changes, flip `ALWAYS_INCLUDE_LOG_URL` in `main.py` and regenerate this file
+with the key stripped out. A `log_url` that does not match byte for byte fails
+exact match grading on its own, with a correct answer sitting right beside it,
+so this is the first thing to check when a whole family fails at once.
 
 Run them:
 
 ```bash
-python3 generate.py --students students.csv
-python3 collect.py  --students students.csv
-python3 grade.py    --students students.csv
-cat data/*/grade.json
+python3 generate.py --students students.csv     # no network
+python3 collect.py  --students students.csv     # the only Telegram step
+python3 grade.py    --students students.csv     # no network
+python3 validate.py --log run.jsonl             # is the score even meaningful
 ```
+
+`validate.py` is the important one and is documented at the bottom of this
+file. Read it before reading `grade.json`: a run broken by a sleeping host and
+a run failed by weak reasoning produce the same low number, and fixing the
+wrong one costs a full set of API credits.
 
 ## Family a: inline computation, 18 questions, all auto graded
 
@@ -59,7 +74,7 @@ turn must be answered with exactly one message; only the last is graded.
 | `b04_multiturn_revision` | a correction that adds a value |
 | `b05_multiturn_four_turns` | four turns, context held throughout |
 
-## Family c: output shape, 5 questions, 2 auto graded
+## Family c: output shape, 5 questions, all auto graded
 
 | id | what it catches |
 | --- | --- |
@@ -69,11 +84,13 @@ turn must be answered with exactly one message; only the last is graded.
 | `c04_bare_no_envelope` | envelope must NOT be added when not asked for |
 | `c05_prose_bait` | asks for an explanation, must still send only JSON |
 
-`c01` to `c03` are `MANUAL_CHECK` because `log_url` cannot be predicted by the
-key, so exact match is impossible by construction. Check by eye that the sum or
-list is right, the envelope is present, and the URL is real.
+All five are auto graded. `c01` to `c03` were previously manual on the grounds
+that `log_url` could not be predicted; it can, because the bot's URL is fixed
+and `make_questions.py` writes the same value into the key. That turns three
+eyeball checks into three exact match checks, which is worth having: the
+envelope questions are exactly where a shape bug hides.
 
-## Family d: retrieval, 10 questions, 3 auto graded
+## Family d: retrieval, 10 questions, 3 auto graded, 7 manual
 
 This is the family worth your attention. Inline arithmetic is proven; retrieval
 is where marks are still at risk.
@@ -95,7 +112,8 @@ is where marks are still at risk.
 2019-21 national ratio of 93, the 37 point fall from the 2014-16 period, and
 the SDG target of 70.
 
-`d01`, `d02`, `d03`, `d04`, `d05` and `d09` are `MANUAL_CHECK` on purpose. Their
+`d01`, `d02`, `d03`, `d04`, `d05`, `d09` and `d10` are `MANUAL_CHECK` on
+purpose. Their
 answers change every time the bulletin is reissued, so hardcoding today's
 answer would train the agent on a fact instead of on the habit of checking the
 edition. Verify them against the newest bulletin at
@@ -106,9 +124,19 @@ district name and fails on any null, empty string, `N/A` or angle bracket text.
 
 ## Reading the output
 
-Expect roughly 29 of 38 marked correct, with the nine `MANUAL_CHECK` rows
-marked incorrect by construction. A `MANUAL_CHECK` row is only a real failure if
-the value shown after `got` is wrong on inspection.
+Expect 31 of 38 marked correct, with the seven `MANUAL_CHECK` rows marked
+incorrect by construction. A `MANUAL_CHECK` row is only a real failure if the
+value shown after `got` is wrong on inspection.
+
+Anything below 31 on the auto graded rows is a real regression. Run
+`validate.py` first: it separates the three failure modes that `grade.json`
+cannot tell apart.
+
+| what `grade.json` says | what it can actually mean |
+| --- | --- |
+| `timeout` | the host was asleep or crashed. Nothing to do with the answer. |
+| `format_error` | the answer may be perfect; prose leaked in beside the JSON. |
+| `expected X, got Y` | a real wrong answer, OR a `log_url` mismatch of one character. |
 
 To see what the agent actually did on any question:
 
@@ -119,3 +147,21 @@ grep -E '"event": "(task_boundary|conformed|search_engine|repeat_blocked)"' run.
 
 A family `a`, `b` or `c` question that logged a `search_engine` event is a
 routing bug: the data was in the message and the agent went to the web anyway.
+
+## validate.py
+
+Three checks, in order, because a failure in an earlier one makes the later
+ones meaningless:
+
+1. **Transport.** Every question reached the bot, and every turn drew exactly
+   one reply. A turn that drew two replies shifts every later answer by one and
+   can fail a whole run from a single duplicate.
+2. **Contract.** The final reply survives `json.loads` on the raw string, which
+   is precisely what `grade.py` does and nothing more, and carries a `log_url`
+   that is neither `localhost` nor a placeholder.
+3. **Behaviour.** Read from the agent's own log: which models ran, whether any
+   LLM call errored, whether a `shape_fallback` was ever shipped, and whether
+   an inline family question ran a web search it had no reason to run.
+
+Exit code 0 means the score can be trusted. Exit code 1 means fix the plumbing
+and collect again before drawing any conclusion about the agent.

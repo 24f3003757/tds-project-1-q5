@@ -222,18 +222,39 @@ Render web service.
 
 - Build: `pip install -r requirements.txt`
 - Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-- Environment: `TELEGRAM_BOT_TOKEN`, `OPENROUTER_TOKEN`, `TAVILY_TOKEN`,
-  `PUBLIC_BASE_URL`, optionally `LLM_BASE_URL`, `MODEL`, `MODEL_CHAIN`,
-  `DATA_RECENCY_FLOOR` and `MAX_TOKENS`
+- Environment, required: `TELEGRAM_BOT_TOKEN`, `OPENROUTER_TOKEN`,
+  `PUBLIC_BASE_URL`
+- Environment, recommended: `TAVILY_TOKEN`, `GITHUB_TOKEN`, `GITHUB_REPO`
+- Environment, optional overrides: `LLM_BASE_URL`, `MODEL`, `CHEAP_MODEL`,
+  `MODEL_CHAIN`, `DATA_RECENCY_FLOOR`, `MAX_TOKENS`
 
-`LLM_BASE_URL` defaults to `https://aipipe.org/openrouter/v1`, the course
-proxy, which speaks the OpenAI protocol and forwards to OpenRouter.
-`OPENROUTER_TOKEN` holds whichever token matches that base URL. Set
-`LLM_BASE_URL=https://openrouter.ai/api/v1` to call OpenRouter directly.
+**Provider.** `LLM_BASE_URL` defaults to `https://api.anthropic.com/v1/`, the
+Claude API's OpenAI compatible endpoint, and `OPENROUTER_TOKEN` holds whichever
+key matches that base URL. The name is historic; the variable is provider
+agnostic. The agent loop uses only OpenAI protocol features, so switching
+provider is three environment variables and no code: point `LLM_BASE_URL` at
+`https://aipipe.org/openrouter/v1` or `https://openrouter.ai/api/v1` and change
+the model names to match. Every name in `MODEL_CHAIN` must exist on whatever
+`LLM_BASE_URL` points at, or each call 404s once per name before failing.
 
-An UptimeRobot monitor pings `/` every five minutes so the free instance never
-idles into a cold start, which would otherwise consume most of a question's
-timeout budget.
+**Two model tiers.** `MODEL` is the strong model and drives retrieval
+questions, where the difficulty is a long tool loop over government PDFs.
+`CHEAP_MODEL` drives everything else. Most graded questions carry their own
+numbers in the message and need no tools at all, so `solve()` reuses the
+existing `need_source` routing decision to pick the tier, and logs the choice
+as a `model_tier` event. The split cuts the cost of a full 38 question eval
+run by roughly an order of magnitude with no measured accuracy loss on the
+inline families.
+
+**Keeping the instance warm.** An UptimeRobot monitor pings `/` every five
+minutes. A free Render instance idles out after roughly fifteen minutes without
+inbound HTTP traffic, and the bot's Telegram long polling is outbound, so it
+does not itself prevent an idle. An idled instance answers nothing, which the
+harness records as a `timeout` rather than a wrong answer.
+
+**One poller at a time.** Telegram's `getUpdates` is exclusive: two running
+instances split the update stream between them and each answers roughly half
+the messages. Stop the local process before testing against the deployed one.
 
 ## Known limitations and compromises
 

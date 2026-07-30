@@ -131,6 +131,18 @@ skeleton parser strips the quotes around a quoted placeholder before
 substituting, since `"<state name>"` would otherwise substitute to `""?""`,
 which is not valid JSON.
 
+**Model fallback chain.** Every model call walks `MODEL_CHAIN` until one
+returns. A single point of failure on the primary model is unusually damaging
+here: an exhausted balance, a rate limit or a provider outage makes the first
+call raise, so no tool ever runs, the grounding gate is never satisfied, and
+the shape fallback ships a skeleton full of `"?"` placeholders that is
+guaranteed to be marked wrong. Every question fails at once and the failure
+looks like a logic bug rather than a billing problem. A cheaper model answering
+imperfectly is strictly better than no model answering, so the chain ends on
+low cost models. Falls are logged as `model_error` and `model_fallback`, and if
+every candidate fails the last exception is re-raised so real bugs still
+surface.
+
 **Capped `max_tokens`.** OpenRouter reserves the requested ceiling against the
 account balance before a call runs, so an uncapped request fails on a low
 balance even though the actual reply is tiny. Capped at 1200.
@@ -165,7 +177,7 @@ Render web service.
 - Build: `pip install -r requirements.txt`
 - Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
 - Environment: `TELEGRAM_BOT_TOKEN`, `OPENROUTER_TOKEN`, `TAVILY_TOKEN`,
-  `PUBLIC_BASE_URL`, optionally `MODEL` and `MAX_TOKENS`
+  `PUBLIC_BASE_URL`, optionally `MODEL`, `MODEL_CHAIN` and `MAX_TOKENS`
 
 An UptimeRobot monitor pings `/` every five minutes so the free instance never
 idles into a cold start, which would otherwise consume most of a question's

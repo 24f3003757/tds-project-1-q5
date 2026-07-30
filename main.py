@@ -35,6 +35,45 @@ BRAVE_TOKEN = os.environ.get("BRAVE_TOKEN", "")
 GOOGLE_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GOOGLE_CX = os.environ.get("GOOGLE_CX", "")
 MODEL = os.environ.get("MODEL", "openai/gpt-4o-mini")
+
+# Fallback chain. Credit exhaustion, a rate limit or a provider outage on the
+# primary model would otherwise take every question down at once: solve() would
+# raise on the first call, no tool would ever run, and the shape fallback would
+# ship a skeleton full of "?" placeholders that is guaranteed to be marked
+# wrong. A cheaper model answering imperfectly beats no model answering at all,
+# so each call walks this list until one returns.
+MODEL_CHAIN = [m.strip() for m in
+               os.environ.get("MODEL_CHAIN",
+                              "openai/gpt-4o-mini,"
+                              "meta-llama/llama-3.3-70b-instruct,"
+                              "google/gemini-2.0-flash-001").split(",")
+               if m.strip()]
+
+
+def model_candidates():
+    """The primary model first, then any fallback not equal to it."""
+    return [MODEL] + [m for m in MODEL_CHAIN if m != MODEL]
+
+
+def complete(run_id=None, **kwargs):
+    """client.chat.completions.create with a model fallback chain.
+
+    Only the model is varied; everything else is passed through untouched. The
+    last error is re-raised if every candidate fails, so genuine bugs still
+    surface rather than being swallowed.
+    """
+    last = None
+    for i, name in enumerate(model_candidates()):
+        try:
+            resp = client.chat.completions.create(model=name, **kwargs)
+            if i:
+                log("model_fallback", run_id=run_id, used=name, after=i)
+            return resp
+        except Exception as e:
+            last = e
+            log("model_error", run_id=run_id, model=name,
+                error=f"{type(e).__name__}: {e}"[:300])
+    raise last
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1200"))  # cap the reservation
                                                         # OpenRouter holds per call
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -517,9 +556,8 @@ def solve(history, run_id, max_steps=12, time_budget=100):
     for step in range(max_steps):
         if time.time() > deadline:
             break
-        resp = client.chat.completions.create(
-            model=MODEL, messages=convo, tools=TOOLS, temperature=0,
-            max_tokens=MAX_TOKENS)
+        resp = complete(run_id=run_id, messages=convo, tools=TOOLS,
+                        temperature=0, max_tokens=MAX_TOKENS)
         msg = resp.choices[0].message
         convo.append(msg.model_dump(exclude_none=True))
         log("llm_step", run_id=run_id, step=step,
@@ -576,8 +614,8 @@ def solve(history, run_id, max_steps=12, time_budget=100):
         "Time is up. Answer NOW using what you already retrieved. Reply with "
         "exactly one JSON object in the requested shape and nothing else."})
     try:
-        final = client.chat.completions.create(
-            model=MODEL, messages=convo, temperature=0, max_tokens=MAX_TOKENS)
+        final = complete(run_id=run_id, messages=convo, temperature=0,
+                         max_tokens=MAX_TOKENS)
         out = final.choices[0].message.content or ""
         log("forced_final", run_id=run_id, content=out)
         return out, convo
@@ -894,8 +932,8 @@ def _handle(chat_id, text):
                 "answer using everything you retrieved plus your best "
                 "judgement. Never output N/A, null, unknown or angle brackets. "
                 "Reply with exactly one JSON object in the requested shape."}]
-            final = client.chat.completions.create(
-                model=MODEL, messages=convo, temperature=0, max_tokens=MAX_TOKENS)
+            final = complete(run_id=run_id, messages=convo, temperature=0,
+                             max_tokens=MAX_TOKENS)
             retry = final.choices[0].message.content or ""
             log("commit_result", run_id=run_id, content=retry[:500])
             retry_obj = extract_json_object(retry)
@@ -931,7 +969,7 @@ def handle(chat_id, text):
 def poll_loop():
     offset = None
     started = time.time()
-    log("boot", log_url=LOG_URL, model=MODEL)
+    log("boot", log_url=LOG_URL, model=MODEL, chain=model_candidates())
     while True:
         try:
             r = requests.get(f"{API}/getUpdates",

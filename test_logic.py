@@ -307,6 +307,56 @@ check("every fallback matches the provider in LLM_BASE_URL",
 check("base url ends in a slash so the SDK can append a path",
       m.LLM_BASE_URL.endswith("/"), True)
 
+print("\n=== regressions caught in the first live run ===")
+
+# A message that ANNOUNCES data opens a new task. Previously the vocabulary
+# free fallback saw numbers in the history, assumed continuity, and carried the
+# previous question's values into the new one: a filtered count came back
+# including a value from the question before it.
+check("'I have some measurements to share' opens a new task",
+      m.references_prior("I have some measurements to share.",
+                         ["The readings are [340, 325, 351]"]), False)
+check("'I am going to give you some data' opens a new task",
+      m.references_prior("I am going to give you some data, then ask one "
+                         "question about it.", ["Data: [1, 2, 3]"]), False)
+check("'Here is the first dataset' opens a new task",
+      m.references_prior("Here is the first dataset.", ["Data: [1, 2, 3]"]), False)
+check("an explicit cue still beats the announcement rule",
+      m.references_prior("Now ignore what I said, I have more.",
+                         ["Data: [1, 2, 3]"]), True)
+check("a bare follow up is still a continuation",
+      m.references_prior("Give me the median too.",
+                         ["Data: [1, 2, 3]"]), True)
+
+check("b04 then b05 resets rather than contaminating",
+      _seq(["The readings are [340, 325, 351, 227, 510]",
+            "Correction: I missed one. Also include 379.",
+            'What is the mean of all the readings? ' + TAIL + '{"mean": <n>}',
+            "I have some measurements to share.",
+            "The measurements are [198, 32, 87, 191, 167, 94]",
+            "Ignore any measurement below 50.",
+            'How many are left? ' + TAIL + '{"count": <n>}']),
+      [1, 2, 3, 1, 2, 3, 4])
+
+# Intermediate turns are acknowledged, graded turns are answered.
+check("a preamble is not a graded turn", m.is_task_terminus(T1), False)
+check("bare data is not a graded turn", m.is_task_terminus(T2), False)
+check("a filter instruction is not a graded turn",
+      m.is_task_terminus("Ignore any measurement below 50."), False)
+check("every question that states a shape IS a graded turn",
+      all(m.is_task_terminus(q) for q in [MEAN, SORTED, MMR, WRAP_OBJ, SDG,
+                                          GIVEN_URL, T3, F3]), True)
+
+# Parameter deprecation: the model name is remembered so the rejected field is
+# sent once per process, not once per request.
+check("a deprecation message yields the parameter name",
+      m._PARAM_RE.search("`temperature` is deprecated for this model.").group(1),
+      "temperature")
+check("an unsupported message yields the parameter name",
+      m._PARAM_RE.search("top_k is not supported").group(1), "top_k")
+check("an unrelated error yields nothing",
+      m._PARAM_RE.search("Error code: 429 - rate limited"), None)
+
 print("\n=== prompt guardrails present ===")
 check("ratio magnitude guidance", "100,000 live births" in m.SYSTEM, True)
 check("edition recency guidance",

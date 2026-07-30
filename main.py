@@ -85,6 +85,37 @@ def model_candidates(primary=None):
     return [primary] + [m for m in MODEL_CHAIN if m != primary]
 
 
+# Newer Claude models reject `temperature` outright: on 4.7 and later only the
+# default value is accepted, and sending the field at all is a 400 before the
+# model is even invoked. The parameter a given model refuses is discovered from
+# the error text on the first rejection and remembered, so the cost is one
+# wasted call per process rather than one per request. Written generically
+# because the next deprecation will land the same way.
+_DROPPED = {}                       # model -> set of parameter names to omit
+_DROP_LOCK = threading.Lock()
+_PARAM_RE = re.compile(
+    r"`?([a-z_]+)`?\s+is\s+(?:deprecated|not supported|unsupported)", re.I)
+
+
+def _call_model(name, kwargs):
+    with _DROP_LOCK:
+        drop = set(_DROPPED.get(name, ()))
+    if drop:
+        kwargs = {k: v for k, v in kwargs.items() if k not in drop}
+    try:
+        return client.chat.completions.create(model=name, **kwargs)
+    except Exception as e:
+        m = _PARAM_RE.search(str(e))
+        param = m.group(1) if m else None
+        if not (param and param in kwargs):
+            raise
+        with _DROP_LOCK:
+            _DROPPED.setdefault(name, set()).add(param)
+        log("param_dropped", model=name, param=param)
+        return client.chat.completions.create(
+            model=name, **{k: v for k, v in kwargs.items() if k != param})
+
+
 def complete(run_id=None, model=None, **kwargs):
     """client.chat.completions.create with a model fallback chain.
 
@@ -95,7 +126,7 @@ def complete(run_id=None, model=None, **kwargs):
     last = None
     for i, name in enumerate(model_candidates(model)):
         try:
-            resp = client.chat.completions.create(model=name, **kwargs)
+            resp = _call_model(name, kwargs)
             if i:
                 log("model_fallback", run_id=run_id, used=name, after=i)
             return resp
@@ -808,6 +839,17 @@ CONT_RE = re.compile(
     r"^\s*(now|also|then|and|next|instead|ignore|exclude|drop|remove|"
     r"using|from (?:that|those|it)|what about)\b", re.I)
 
+# The opposite cue: a message that ANNOUNCES data it is about to send opens a
+# new task rather than continuing the last one. Without this, the vocabulary
+# free fallback at the end of references_prior sees a history that contains
+# numbers, concludes "this must be about those", and carries the previous
+# question's data into the new one. That is how a filtered count came back
+# including a value from the question before it.
+ANNOUNCE_RE = re.compile(
+    r"^\s*(?:ok(?:ay)?[,. ]+)?(?:i (?:am going to|will|'ll|have|want to)\b|"
+    r"here (?:is|are|comes)\b|let me (?:give|share|send|show)\b|"
+    r"i'?m going to\b)", re.I)
+
 # Naming any of these means the data lives outside the message.
 DATASET_HINTS = ("mospi", "data.gov.in", "census", "http://", "https://",
                  "dataset", "bulletin", "nfhs", "pib", "world bank", "rbi",
@@ -970,6 +1012,8 @@ def references_prior(text, hist=None):
         return False
     if PRIOR_RE.search(text) or CONT_RE.search(text):
         return True
+    if ANNOUNCE_RE.search(text):
+        return False
     return bool(hist) and any(has_inline_data(h) for h in hist)
 
 
@@ -1150,6 +1194,12 @@ CHAT_LOCKS = {}     # chat_id -> lock, so replies cannot overtake each other
 LOCKS_GUARD = threading.Lock()
 CONTEXT_GAP = 240   # seconds; a longer pause means a new, unrelated question
 
+# Reply to turns that state no output shape with a bare acknowledgement rather
+# than running the agent on them. Set ACK_INTERMEDIATE=0 to answer every turn
+# in full, which is only needed if a graded question ever arrives without
+# stating its JSON shape.
+ACK_INTERMEDIATE = os.environ.get("ACK_INTERMEDIATE", "1") != "0"
+
 
 def chat_lock(chat_id):
     with LOCKS_GUARD:
@@ -1187,6 +1237,20 @@ def _handle(chat_id, text):
     hist.append(text)
     del hist[:-6]
     log("received", run_id=run_id, chat_id=chat_id, text=text)
+
+    # A message that states no output shape is never the graded turn: the
+    # specification says every question spells out the JSON shape it wants, so
+    # a turn without one is background ("I have some measurements to share").
+    # The harness still needs exactly one reply per message, so acknowledge it
+    # and stop. Running the full agent on background turns bought nothing and
+    # cost a great deal: it produced replies like "I don't see any data yet",
+    # burnt a commitment retry on each one, and left the model's own confused
+    # guesses sitting in the conversation for the turn that IS graded.
+    if ACK_INTERMEDIATE and not is_task_terminus(text):
+        reply = json.dumps({"ack": True, "log_url": LOG_URL})
+        log("ack_intermediate", run_id=run_id, chat_id=chat_id, reply=reply)
+        send(chat_id, reply)
+        return
 
     convo = None
     try:
